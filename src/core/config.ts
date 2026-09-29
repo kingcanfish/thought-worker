@@ -1,0 +1,51 @@
+export interface Config {
+  botToken: string;
+  webhookSecret: string;
+  channelId: number | null;
+  /** 公开频道的用户名（不带 @），用于生成 t.me 回链 */
+  channelUsername: string | null;
+  siteTitle: string;
+  siteDescription: string;
+  /** 头像：图片 URL，或用作文字头像的一个字 */
+  siteAvatar: string;
+  /** 站点对外地址（RSS / OG 用），不填就用请求的 origin */
+  siteUrl: string | null;
+  siteTz: string;
+  /** 媒体地址前缀：/m（经应用转发）或 https://media.example.com（对象存储直出） */
+  mediaBase: string;
+  maxDownloadBytes: number;
+  telegramApiBase: string;
+  pageSize: number;
+}
+
+type Env = Record<string, unknown>;
+
+const str = (env: Env, key: string): string | null => {
+  const v = env[key];
+  return typeof v === "string" && v.trim() !== "" ? v.trim() : null;
+};
+
+const int = (env: Env, key: string, fallback: number): number => {
+  const v = str(env, key);
+  const n = v === null ? NaN : Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+export function loadConfig(env: Env): Config {
+  const channelId = str(env, "CHANNEL_ID");
+  return {
+    botToken: str(env, "BOT_TOKEN") ?? "",
+    webhookSecret: str(env, "WEBHOOK_SECRET") ?? "",
+    channelId: channelId === null ? null : Number(channelId),
+    channelUsername: str(env, "CHANNEL_USERNAME")?.replace(/^@/, "") ?? null,
+    siteTitle: str(env, "SITE_TITLE") ?? "碎碎念",
+    siteDescription: str(env, "SITE_DESCRIPTION") ?? "",
+    siteAvatar: str(env, "SITE_AVATAR") ?? "念",
+    siteUrl: str(env, "SITE_URL")?.replace(/\/+$/, "") ?? null,
+    siteTz: str(env, "SITE_TZ") ?? "Asia/Shanghai",
+    mediaBase: (str(env, "MEDIA_BASE") ?? "/m").replace(/\/+$/, ""),
+    maxDownloadBytes: int(env, "MAX_DOWNLOAD_BYTES", 20 * 1024 * 1024),
+    telegramApiBase: (str(env, "TELEGRAM_API_BASE") ?? "https://api.telegram.org").replace(/\/+$/, ""),
+    pageSize: int(env, "PAGE_SIZE", 20),
+  };
+}
