@@ -1,5 +1,6 @@
 // 抓取网页的 OG / Twitter Card 信息。只用 fetch + 正则，不依赖平台专有的 HTML 解析器。
 import { decodeEntities, safeUrl } from "../lib/html";
+import { guardedFetch } from "../lib/url-guard";
 
 export interface LinkMeta {
   url: string;
@@ -46,11 +47,12 @@ export async function readLimited(body: ReadableStream<Uint8Array>, limit: numbe
 }
 
 export async function fetchLinkMeta(fetchFn: typeof fetch, url: string): Promise<LinkMeta | null> {
-  const res = await fetchFn(url, {
+  const fetched = await guardedFetch(fetchFn, url, {
     headers: { "user-agent": UA, accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5" },
-    redirect: "follow",
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
+  if (!fetched) return null;
+  const res = fetched.response;
   if (!res.ok || !res.body) return null;
   const contentType = res.headers.get("content-type") ?? "";
   if (!/html|xml/i.test(contentType)) {
@@ -59,7 +61,7 @@ export async function fetchLinkMeta(fetchFn: typeof fetch, url: string): Promise
   }
   const bytes = await readLimited(res.body, MAX_HTML_BYTES, true);
   if (!bytes) return null;
-  return parseLinkMeta(decodeHtml(bytes, contentType), res.url || url);
+  return parseLinkMeta(decodeHtml(bytes, contentType), fetched.url);
 }
 
 function decodeHtml(bytes: Uint8Array, contentType: string): string {

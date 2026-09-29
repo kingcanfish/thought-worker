@@ -2,7 +2,8 @@
 import { imageSize } from "../lib/image-size";
 import { safeUrl } from "../lib/html";
 import { nowSeconds } from "../lib/time";
-import { CONTENT_TAG, type Deps } from "../ports";
+import { guardedFetch } from "../lib/url-guard";
+import type { Deps } from "../ports";
 import { firstLink } from "../telegram/entities";
 import type { LinkPreviewPrefs } from "../telegram/normalize";
 import type { TgEntity } from "../telegram/types";
@@ -18,8 +19,10 @@ async function sha256Hex(s: string): Promise<string> {
 
 async function storeImage(deps: Deps, url: string) {
   try {
-    const res = await deps.fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok || !res.body) return null;
+    // og:image 来自第三方网页，不是作者写的，同样要挡住内网地址
+    const fetched = await guardedFetch(deps.fetch, url, { signal: AbortSignal.timeout(5000) });
+    const res = fetched?.response;
+    if (!res?.ok || !res.body) return null;
     const bytes = await readLimited(res.body, MAX_IMAGE_BYTES, false);
     const info = bytes && imageSize(bytes);
     if (!bytes || !info) return null;
@@ -45,10 +48,7 @@ export async function refreshLinkPreview(deps: Deps, postId: number, prefs?: Lin
 
   const existing = await deps.db.first<{ url: string; status: string }>("SELECT url, status FROM link_previews WHERE post_id = ?", [postId]);
   if (!url) {
-    if (existing) {
-      await deps.db.run("DELETE FROM link_previews WHERE post_id = ?", [postId]);
-      await deps.cache.purge([CONTENT_TAG]);
-    }
+    if (existing) await deps.db.run("DELETE FROM link_previews WHERE post_id = ?", [postId]);
     return;
   }
   if (existing?.url === url && existing.status === "ready") return;
@@ -88,5 +88,4 @@ export async function refreshLinkPreview(deps: Deps, postId: number, prefs?: Lin
       nowSeconds(),
     ],
   );
-  if (ok) await deps.cache.purge([CONTENT_TAG]);
 }

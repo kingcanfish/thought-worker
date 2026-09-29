@@ -1,16 +1,16 @@
 // Webhook 更新 → 入库。幂等：同一条消息重复投递只会覆盖，不会重复。
-import { CONTENT_TAG, type Deps, type SqlStatement } from "../ports";
+import type { Deps, SqlStatement } from "../ports";
 import { TelegramClient } from "../telegram/client";
 import { extractTags, renderEntities } from "../telegram/entities";
-import { normalizeMessage, type MediaRef, type NormalizedMessage } from "../telegram/normalize";
+import { normalizeMessage, type LinkPreviewPrefs, type MediaRef, type NormalizedMessage } from "../telegram/normalize";
 import type { TgUpdate } from "../telegram/types";
 import { nowSeconds } from "../lib/time";
-import { refreshLinkPreview } from "./link-preview";
 import { transferMedia, type TransferResult } from "./media";
 
 export type IngestResult =
   | { action: "ignored"; reason: string }
-  | { action: "saved"; postId: number }
+  /** textOnly：纯文字消息，需要（重新）生成链接预览，prefs 为这条消息的预览偏好 */
+  | { action: "saved"; postId: number; textOnly: boolean; prefs?: LinkPreviewPrefs }
   | { action: "deleted"; postId: number | null };
 
 export const tagHref = (tag: string): string => `/?tag=${encodeURIComponent(tag)}`;
@@ -32,11 +32,8 @@ export async function handleUpdate(deps: Deps, update: TgUpdate): Promise<Ingest
 
   const postId = await savePost(deps, n, !!update.edited_channel_post);
   for (const ref of n.media) await saveMedia(deps, tg, postId, n.messageId, ref);
-  await deps.cache.purge([CONTENT_TAG]);
-
-  // 纯文字消息才有链接预览；抓取放到后台，不阻塞 webhook 返回
-  if (n.media.length === 0) deps.tasks.run(() => refreshLinkPreview(deps, postId, n.linkPreview));
-  return { action: "saved", postId };
+  // 链接预览不在这里抓：同一批里可能还有这条消息的编辑，由调用方在整批处理完后按最后的状态抓一次
+  return { action: "saved", postId, textOnly: n.media.length === 0, prefs: n.linkPreview };
 }
 
 async function savePost(deps: Deps, n: NormalizedMessage, isEdit: boolean): Promise<number> {
@@ -116,17 +113,23 @@ async function saveMedia(deps: Deps, tg: TelegramClient, postId: number, message
     : await transferMedia(deps, tg, ref);
 
   await deps.db.run(
-    `INSERT INTO media (post_id, message_id, kind, file_unique_id, blob_key, thumb_key, mime, width, height, duration, size, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO media (post_id, message_id, kind, file_id, file_unique_id, thumb_file_id, thumb_unique_id,
+                        blob_key, thumb_key, mime, width, height, duration, size, status, attempts)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
      ON CONFLICT (post_id, message_id) DO UPDATE SET
-       kind = excluded.kind, file_unique_id = excluded.file_unique_id, blob_key = excluded.blob_key,
-       thumb_key = excluded.thumb_key, mime = excluded.mime, width = excluded.width, height = excluded.height,
-       duration = excluded.duration, size = excluded.size, status = excluded.status`,
+       kind = excluded.kind, file_id = excluded.file_id, file_unique_id = excluded.file_unique_id,
+       thumb_file_id = excluded.thumb_file_id, thumb_unique_id = excluded.thumb_unique_id,
+       blob_key = excluded.blob_key, thumb_key = excluded.thumb_key, mime = excluded.mime,
+       width = excluded.width, height = excluded.height, duration = excluded.duration,
+       size = excluded.size, status = excluded.status, attempts = 1`,
     [
       postId,
       messageId,
       ref.kind,
+      ref.fileId,
       ref.fileUniqueId,
+      ref.thumb?.fileId ?? null,
+      ref.thumb?.fileUniqueId ?? null,
       r.blobKey,
       r.thumbKey,
       r.mime,
@@ -158,10 +161,7 @@ async function deletePost(deps: Deps, tg: TelegramClient, n: NormalizedMessage):
       ])
     : null;
 
-  if (target) {
-    await deps.db.run("UPDATE posts SET deleted = 1 WHERE id = ?", [target.post_id]);
-    await deps.cache.purge([CONTENT_TAG]);
-  }
+  if (target) await deps.db.run("UPDATE posts SET deleted = 1 WHERE id = ?", [target.post_id]);
   await tryDelete([n.messageId]);
   if (target) {
     const rows = await deps.db.all<{ message_id: number }>("SELECT message_id FROM messages WHERE post_id = ?", [target.post_id]);

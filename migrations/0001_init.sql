@@ -30,7 +30,10 @@ CREATE TABLE media (
   post_id         INTEGER NOT NULL REFERENCES posts (id),
   message_id      INTEGER NOT NULL,             -- 排序用
   kind            TEXT    NOT NULL,             -- photo | video | gif
+  file_id         TEXT    NOT NULL,             -- 对 bot 长期有效，下载失败时用它重试
   file_unique_id  TEXT    NOT NULL,
+  thumb_file_id   TEXT,
+  thumb_unique_id TEXT,
   blob_key        TEXT,                         -- NULL：未转存（过大 / 失败）
   thumb_key       TEXT,                         -- 图片：中等尺寸；视频 / GIF：封面
   mime            TEXT,
@@ -39,6 +42,7 @@ CREATE TABLE media (
   duration        INTEGER,
   size            INTEGER,
   status          TEXT    NOT NULL DEFAULT 'pending',  -- pending | ready | too_large | failed
+  attempts        INTEGER NOT NULL DEFAULT 0,          -- 下载尝试次数，failed 时每次构建重试，上限见 MAX_ATTEMPTS
   UNIQUE (post_id, message_id)
 );
 

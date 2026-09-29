@@ -46,6 +46,10 @@ export interface NormalizedMessage {
   command?: "del";
 }
 
+/** 浏览器能直接显示、且不会执行脚本的格式；SVG（可含脚本）、HEIC、TIFF 等不当作图片 */
+const WEB_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+const WEB_VIDEO_MIMES = new Set(["video/mp4", "video/webm", "video/quicktime"]);
+
 /** 缩略图的目标边长：选不小于它的最小一档 */
 const THUMB_TARGET = 720;
 
@@ -121,10 +125,10 @@ function extractMedia(m: TgMessage): MediaRef[] {
   }
   const doc = m.document;
   const mime = doc?.mime_type ?? "";
-  if (doc && (mime.startsWith("image/") || mime.startsWith("video/"))) {
+  if (doc && (WEB_IMAGE_MIMES.has(mime) || WEB_VIDEO_MIMES.has(mime))) {
     return [
       {
-        kind: mime.startsWith("image/") ? "photo" : "video",
+        kind: WEB_IMAGE_MIMES.has(mime) ? "photo" : "video",
         fileId: doc.file_id,
         fileUniqueId: doc.file_unique_id,
         size: doc.file_size,
