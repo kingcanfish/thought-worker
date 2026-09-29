@@ -1,9 +1,15 @@
-// 页面交互：筛选 / 无限滚动 / 日历 / 灯箱 / 主题。无构建步骤，改了记得把 layout.tsx 里的 ASSET_VERSION 加一。
+// 页面交互：筛选 / 搜索 / 无限滚动 / 日历 / 灯箱 / 主题。纯静态站点，数据来自构建生成的 /data：
+//   /data/index.json        每条帖子的 id、时间、日期、标签、纯文本（筛选、搜索、热力图用）
+//   /data/month/YYYY-MM.json  该月每条帖子渲染好的 HTML
+// 无构建步骤，改了记得把 layout.tsx 里的 ASSET_VERSION 加一。
 (() => {
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => [...r.querySelectorAll(s)];
   const root = document.documentElement;
   const mobile = matchMedia("(max-width: 760px)");
+  const BUILD = root.dataset.build || "";
+  const WEEK = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+  const PRELOAD_PX = 800;
 
   /* ── 日期：统一按站点时区（<html data-tz>），日期键为 YYYY-MM-DD ── */
   const TZ = root.dataset.tz || "Asia/Shanghai";
@@ -19,8 +25,9 @@
     const [, m, d] = k.split("-").map(Number);
     return `${m}月${d}日`;
   };
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-  // 「今天 / 昨天」由前端算：页面会被缓存，服务端写死的相对日期过了零点就不对了
+  // 「今天 / 昨天」由前端算：静态页面构建时写死的相对日期过了零点就不对了
   function relDays(scope = document) {
     const today = todayKey();
     for (const el of $$("[data-rel-day]", scope)) {
@@ -38,11 +45,41 @@
     t._timer = setTimeout(() => t.classList.remove("show"), 1600);
   }
 
+  /* ── 数据 ── */
+  let indexPromise = null;
+  const loadIndex = () => {
+    indexPromise ??= fetch(`/data/index.json?v=${BUILD}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .catch((e) => {
+        indexPromise = null; // 下次再试
+        throw e;
+      });
+    return indexPromise;
+  };
+  const months = new Map();
+  const loadMonth = (m) => {
+    if (!months.has(m)) {
+      months.set(
+        m,
+        fetch(`/data/month/${m}.json?v=${BUILD}`)
+          .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+          .catch((e) => {
+            months.delete(m);
+            throw e;
+          }),
+      );
+    }
+    return months.get(m);
+  };
+
   /* ── 筛选状态 ⇄ URL ── */
   const readState = () => {
     const p = new URLSearchParams(location.search);
-    const from = p.get("from");
-    return { tag: p.get("tag"), q: p.get("q"), from, to: p.get("to") || from };
+    const valid = (d) => (d && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null);
+    let from = valid(p.get("from"));
+    let to = valid(p.get("to")) || from;
+    if (from && to && to < from) [from, to] = [to, from];
+    return { tag: p.get("tag") || null, q: p.get("q")?.trim() || null, from, to: from ? to : null };
   };
   const toQuery = (s) => {
     const p = new URLSearchParams();
@@ -54,25 +91,101 @@
     }
     return p.toString();
   };
+  const hasFilters = (s) => !!(s.tag || s.q || s.from);
+  const matches = (p, s) =>
+    (!s.tag || p.g.includes(s.tag)) &&
+    (!s.from || (p.d >= s.from && p.d <= (s.to || s.from))) &&
+    (!s.q || p.s.toLowerCase().includes(s.q.toLowerCase()));
 
   let state = readState();
   const timeline = $("#timeline");
   const isHome = !!$("#filter");
-  let next = timeline?.dataset.next || "";
-  let loading = false;
-  let applySeq = 0;
 
-  async function fetchFragment(s, cursor) {
-    const p = new URLSearchParams(toQuery(s));
-    if (cursor) p.set("cursor", cursor);
-    const res = await fetch(`/fragments/timeline?${p}`, { headers: { accept: "application/json" } });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
+  /**
+   * 当前列表：list 是匹配的索引条目（按时间倒序），shown 是已渲染的条数。
+   * seq 每次切换筛选 +1，异步结果回来时对不上就丢弃，避免新旧筛选的结果混在一起。
+   */
+  const view = { list: null, shown: 0, seq: 0, loading: -1, pageSize: 20 };
+
+  function renderFilterBar(count) {
+    const bar = $("#filter");
+    if (!bar) return;
+    if (!hasFilters(state)) return (bar.innerHTML = "");
+    const date = state.from ? (state.from === state.to ? fmtMD(state.from) : `${fmtMD(state.from)} – ${fmtMD(state.to)}`) : null;
+    bar.innerHTML =
+      (count == null ? "" : `<span>${count} 条结果</span>`) +
+      (date ? `<a class="tag-chip" href="#" data-clear="date">${date} ✕</a>` : "") +
+      (state.tag ? `<a class="tag-chip" href="#" data-clear="tag">#${esc(state.tag)} ✕</a>` : "") +
+      (state.q ? `<a class="tag-chip" href="#" data-clear="q">“${esc(state.q)}” ✕</a>` : "");
   }
 
-  function updateEnd(empty) {
+  function updateEnd() {
     const end = $("#end");
-    if (end) end.textContent = next ? "加载中…" : empty ? "" : "— 到底啦 —";
+    if (!end || !view.list) return;
+    end.textContent = view.shown < view.list.length ? "加载中…" : view.list.length ? "— 到底啦 —" : "";
+  }
+
+  const dayHead = (d) => {
+    const [, m, dd] = d.split("-").map(Number);
+    return `<div class="day-head"><span class="day-num">${dd}</span><span class="day-meta">${m} 月 · ${WEEK[new Date(keyUTC(d)).getUTCDay()]}<em data-rel-day="${d}"></em></span></div>`;
+  };
+
+  /** 按天分组追加；和页面上最后一天相同的并进去，不重复显示日期 */
+  function appendPosts(items) {
+    let section = $$("section.day", timeline).pop();
+    for (const { entry, html } of items) {
+      if (!html) continue;
+      if (section?.dataset.day !== entry.d) {
+        section = document.createElement("section");
+        section.className = "day";
+        section.dataset.day = entry.d;
+        section.innerHTML = dayHead(entry.d);
+        timeline.append(section);
+      }
+      section.insertAdjacentHTML("beforeend", html);
+    }
+    afterRender(timeline);
+  }
+
+  async function renderMore() {
+    const seq = view.seq;
+    if (!view.list || view.loading === seq || view.shown >= view.list.length) return;
+    view.loading = seq;
+    try {
+      const batch = view.list.slice(view.shown, view.shown + view.pageSize);
+      const needed = [...new Set(batch.map((p) => p.d.slice(0, 7)))];
+      const chunks = Object.fromEntries(await Promise.all(needed.map(async (m) => [m, await loadMonth(m)])));
+      if (seq !== view.seq) return;
+      appendPosts(batch.map((entry) => ({ entry, html: chunks[entry.d.slice(0, 7)]?.[entry.id] })));
+      view.shown += batch.length;
+      updateEnd();
+    } catch {
+      if (seq === view.seq) $("#end").textContent = "加载失败，点击重试";
+      return;
+    } finally {
+      if (view.loading === seq) view.loading = -1;
+    }
+    // 追加后底部仍在预加载范围内（大屏 / 帖子很短）时继续加载，不依赖 IntersectionObserver 再次触发
+    requestAnimationFrame(checkEnd);
+  }
+
+  function checkEnd() {
+    const end = $("#end");
+    if (end && view.list && view.shown < view.list.length && end.getBoundingClientRect().top < innerHeight + PRELOAD_PX) {
+      renderMore();
+    }
+  }
+
+  /** 首次滚动到底：首屏是构建时渲染的，接上完整列表继续往下 */
+  async function ensureList() {
+    if (view.list) return;
+    const seq = view.seq;
+    const idx = await loadIndex();
+    if (seq !== view.seq || view.list) return;
+    view.pageSize = idx.pageSize || view.pageSize;
+    view.list = idx.posts.filter((p) => matches(p, state));
+    view.shown = $$("#timeline .post").length;
+    updateEnd();
   }
 
   async function applyState(s, { history: mode = "push", scroll = true } = {}) {
@@ -81,53 +194,23 @@
     const url = qs ? `/?${qs}` : "/";
     if (mode === "push") history.pushState(null, "", url);
     else if (mode === "replace") history.replaceState(null, "", url);
+    const seq = ++view.seq;
     syncChrome();
-    const seq = ++applySeq;
+    renderFilterBar(null);
     try {
-      const data = await fetchFragment(s);
-      if (seq !== applySeq) return; // 已经有更新的筛选
-      $("#filter").innerHTML = data.filter || "";
-      timeline.innerHTML = data.html;
-      next = data.next || "";
-      updateEnd(data.empty);
-      afterRender(timeline);
+      const idx = await loadIndex();
+      if (seq !== view.seq) return;
+      view.pageSize = idx.pageSize || view.pageSize;
+      view.list = idx.posts.filter((p) => matches(p, s));
+      view.shown = 0;
+      timeline.innerHTML = view.list.length ? "" : `<div class="empty">${hasFilters(s) ? "什么也没找到 ¯\\_(ツ)_/¯" : "还没有碎碎念，去频道里发一条吧。"}</div>`;
+      renderFilterBar(hasFilters(s) ? view.list.length : null);
+      updateEnd();
       if (scroll) scrollTo({ top: 0, behavior: "smooth" });
+      await renderMore();
     } catch {
-      toast("加载失败，请稍后再试");
+      if (seq === view.seq) toast("加载失败，请稍后再试");
     }
-  }
-
-  async function loadMore() {
-    if (loading || !next || !timeline) return;
-    loading = true;
-    const seq = applySeq;
-    try {
-      const data = await fetchFragment(state, next);
-      if (seq !== applySeq) return;
-      appendSections(data.html);
-      next = data.next || "";
-      updateEnd(false);
-    } catch {
-      const end = $("#end");
-      if (end) end.textContent = "加载失败，点击重试";
-    } finally {
-      loading = false;
-    }
-  }
-
-  // 追加的第一天如果和页面最后一天相同，合并进去，不重复显示日期标题
-  function appendSections(html) {
-    const tpl = document.createElement("template");
-    tpl.innerHTML = html;
-    const sections = $$("section.day", tpl.content);
-    const last = $$("section.day", timeline).pop();
-    if (last && sections[0] && sections[0].dataset.day === last.dataset.day) {
-      const first = sections.shift();
-      first.querySelector(".day-head")?.remove();
-      last.append(...first.children);
-    }
-    timeline.append(...sections);
-    afterRender(timeline);
   }
 
   function highlight(scope) {
@@ -164,6 +247,28 @@
     highlight(scope);
   }
 
+  /* ── 热力图：按当前日期重画（构建之后可能过了好几天），数据来自索引 ── */
+  const HEAT_WEEKS = 20;
+  function dayCounts(idx) {
+    const counts = {};
+    for (const p of idx.posts) counts[p.d] = (counts[p.d] || 0) + 1;
+    return counts;
+  }
+  async function renderHeatmap() {
+    const el = $("#heatmap");
+    if (!el) return;
+    const counts = dayCounts(await loadIndex());
+    const today = todayKey();
+    const start = addDays(today, -((HEAT_WEEKS - 1) * 7 + new Date(keyUTC(today)).getUTCDay()));
+    let html = "";
+    for (let d = start; d <= today; d = addDays(d, 1)) {
+      const c = counts[d] || 0;
+      html += `<i data-l="${Math.min(c, 4)}" data-day="${d}" title="${fmtMD(d)} · ${c ? `${c} 条` : "没有碎碎念"}"></i>`;
+    }
+    el.innerHTML = html;
+    syncChrome();
+  }
+
   /** 侧栏标签、热力图、日历按钮、搜索框跟随当前筛选 */
   function syncChrome() {
     for (const a of $$("#tags [data-tag]")) a.classList.toggle("active", a.dataset.tag === state.tag);
@@ -179,16 +284,23 @@
   if (isHome) {
     const end = $("#end");
     if (end && "IntersectionObserver" in window) {
-      new IntersectionObserver((es) => es.some((e) => e.isIntersecting) && loadMore(), { rootMargin: "800px 0px" }).observe(end);
+      new IntersectionObserver(
+        async (es) => {
+          if (!es.some((e) => e.isIntersecting)) return;
+          await ensureList().catch(() => {});
+          renderMore();
+        },
+        { rootMargin: `${PRELOAD_PX}px 0px` },
+      ).observe(end);
     }
-    end?.addEventListener("click", loadMore);
-    addEventListener("popstate", () => applyState(readState(), { history: "none" }));
+    end?.addEventListener("click", () => ensureList().then(renderMore).catch(() => {}));
+    addEventListener("popstate", () => applyState(readState(), { history: "none", scroll: false }));
 
     const q = $("#q");
     let timer;
     q?.addEventListener("input", () => {
       clearTimeout(timer);
-      timer = setTimeout(() => applyState({ ...state, q: q.value.trim() || null }, { history: "replace", scroll: false }), 350);
+      timer = setTimeout(() => applyState({ ...state, q: q.value.trim() || null }, { history: "replace", scroll: false }), 250);
     });
     $("form.search")?.addEventListener("submit", (e) => {
       e.preventDefault();
@@ -196,21 +308,14 @@
       applyState({ ...state, q: q.value.trim() || null });
       q.blur();
     });
+
+    // 打开带筛选条件的链接（例如详情页里点了 #标签）
+    if (hasFilters(state)) applyState(state, { history: "none", scroll: false });
+    renderHeatmap().catch(() => {});
   }
 
   /* ── 日历（桌面：弹层；移动端：底部抽屉） ── */
-  const cal = { el: $("#cal"), month: todayKey().slice(0, 8) + "01", pending: false, counts: new Map() };
-
-  async function monthCounts(first) {
-    if (cal.counts.has(first)) return cal.counts.get(first);
-    const last = addDays(addDays(first, 32).slice(0, 8) + "01", -1);
-    const p = fetch(`/api/stats/heatmap?from=${first}&to=${last}`)
-      .then((r) => (r.ok ? r.json() : { counts: {} }))
-      .then((d) => d.counts)
-      .catch(() => ({}));
-    cal.counts.set(first, p);
-    return p;
-  }
+  const cal = { el: $("#cal"), month: todayKey().slice(0, 8) + "01", pending: false };
 
   async function renderCal() {
     if (!cal.el) return;
@@ -219,7 +324,9 @@
     $("#cal-title").textContent = `${y} 年 ${m} 月`;
     const today = todayKey();
     const start = addDays(first, -new Date(keyUTC(first)).getUTCDay());
-    const counts = await monthCounts(first);
+    const counts = await loadIndex()
+      .then(dayCounts)
+      .catch(() => ({}));
     if (first !== cal.month) return;
     const from = state.from;
     const to = state.to || from;
@@ -267,8 +374,7 @@
       const nav = e.target.closest("[data-cal]");
       if (nav) {
         const [y, m] = cal.month.split("-").map(Number);
-        const d = new Date(Date.UTC(y, m - 1 + Number(nav.dataset.cal), 1));
-        cal.month = d.toISOString().slice(0, 10);
+        cal.month = new Date(Date.UTC(y, m - 1 + Number(nav.dataset.cal), 1)).toISOString().slice(0, 10);
         return renderCal();
       }
       const day = e.target.closest("[data-d]");
@@ -402,7 +508,7 @@
 
     const video = t.closest(".m.video[data-video]");
     if (video) {
-      video.innerHTML = `<video src="${video.dataset.video}" controls autoplay playsinline></video>`;
+      video.innerHTML = `<video src="${esc(video.dataset.video)}" controls autoplay playsinline></video>`;
       video.removeAttribute("data-video");
       video.classList.add("playing");
       return;
@@ -474,5 +580,6 @@
   toTop?.addEventListener("click", () => scrollTo({ top: 0, behavior: "smooth" }));
 
   syncStick();
+  syncChrome();
   afterRender(document);
 })();

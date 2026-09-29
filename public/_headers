@@ -1,3 +1,5 @@
 # Cloudflare 静态资源的响应头（Node 适配器在 serveStatic 里设置同样的值）
 /assets/*
   Cache-Control: public, max-age=3600
+/data/*
+  Cache-Control: public, max-age=0, must-revalidate
