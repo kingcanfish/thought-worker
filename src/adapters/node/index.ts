@@ -1,61 +1,37 @@
 import { serveStatic } from "@hono/node-server/serve-static";
-import { mkdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Hono } from "hono";
 import type { Config } from "../../core/config";
-import { createApp } from "../../core/http/app";
-import type { BackgroundTasks, Deps } from "../../core/ports";
-import { FsBlobStore } from "./fs-store";
-import { MemoryResponseCache } from "./memory-cache";
-import { SqliteDatabase, migrate } from "./sqlite";
+import { createReceiverApp } from "../../core/http/app";
+import type { Stores } from "../../core/ports";
 
-/** 后台任务：不阻塞响应，记录未完成的任务以便测试 / 退出时等待 */
-export class PromiseTasks implements BackgroundTasks {
-  private readonly pending = new Set<Promise<unknown>>();
-
-  run(task: () => Promise<unknown>): void {
-    const p = task()
-      .catch((e) => console.error("background task failed", e))
-      .finally(() => this.pending.delete(p));
-    this.pending.add(p);
-  }
-
-  async idle(): Promise<void> {
-    while (this.pending.size) await Promise.all(this.pending);
-  }
-}
-
-export interface NodeOptions {
+export interface ServerOptions {
   config: Config;
-  /** SQLite 文件路径，测试可用 ":memory:" */
-  dbPath: string;
-  mediaDir: string;
-  migrationsDir: string;
-  publicDir: string;
+  stores: Stores;
   fetch?: typeof fetch;
+  /** 构建输出目录（静态站点） */
+  siteDir: string;
 }
 
-export function createNodeServer(opts: NodeOptions) {
-  if (opts.dbPath !== ":memory:") mkdirSync(join(opts.dbPath, ".."), { recursive: true });
-  const db = new SqliteDatabase(opts.dbPath);
-  const applied = migrate(db, opts.migrationsDir);
-  const cache = new MemoryResponseCache();
-  const tasks = new PromiseTasks();
-  const deps: Deps = {
-    config: opts.config,
-    db,
-    blobs: new FsBlobStore(opts.mediaDir),
-    cache,
-    tasks,
-    fetch: opts.fetch ?? fetch,
-  };
-
+/** 自建服务器：接收 webhook + 提供构建好的静态站点 + 媒体 */
+export function createNodeServer(opts: ServerOptions) {
   const app = new Hono();
+  const receiver = createReceiverApp(() => ({ config: opts.config, stores: opts.stores, fetch: opts.fetch ?? fetch }));
+  app.route("/", receiver);
   app.use(
-    "/assets/*",
-    serveStatic({ root: opts.publicDir, onFound: (_path, c) => c.header("Cache-Control", "public, max-age=3600") }),
+    "*",
+    serveStatic({
+      root: opts.siteDir,
+      onFound: (path, c) => {
+        // 页面和数据每次构建都会变；assets 带版本号
+        c.header("Cache-Control", path.includes("/assets/") ? "public, max-age=3600" : "public, max-age=0, must-revalidate");
+      },
+    }),
   );
-  app.use("*", cache.middleware());
-  app.route("/", createApp(() => deps));
-  return { app, deps, db, tasks, applied };
+  app.notFound(async (c) => {
+    const html = await readFile(join(opts.siteDir, "404.html"), "utf8").catch(() => "Not Found");
+    return c.html(html, 404);
+  });
+  return app;
 }

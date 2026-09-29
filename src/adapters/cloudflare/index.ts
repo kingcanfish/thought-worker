@@ -1,42 +1,26 @@
-// Cloudflare Workers 入口
+// Cloudflare Workers 入口：静态文件由 [assets] 直接提供（不经过这里），
+// 没有匹配到静态文件的请求才进来：/tg/webhook、/m/*，其余交回静态资源处理成 404 页。
 import { loadConfig } from "../../core/config";
-import { createApp } from "../../core/http/app";
-import type { Deps, ResponseCache } from "../../core/ports";
-import { D1Adapter } from "./d1";
+import { createReceiverApp } from "../../core/http/app";
 import { R2Adapter } from "./r2";
 
 interface Env {
-  DB: D1Database;
+  /** 图片视频，可以公开 */
   MEDIA: R2Bucket;
+  /** 收件箱、数据库，不能公开 */
+  DATA: R2Bucket;
+  ASSETS: Fetcher;
   [key: string]: unknown;
 }
 
-/** Workers Cache 的标签清除；未开启 [cache] 时 ctx.cache 不存在，直接跳过 */
-class WorkersCache implements ResponseCache {
-  constructor(private readonly ctx: { cache?: { purge(opts: { tags: string[] }): Promise<unknown> } }) {}
-
-  async purge(tags: string[]): Promise<void> {
-    const cache = this.ctx.cache;
-    if (!cache?.purge) return;
-    try {
-      await cache.purge({ tags });
-    } catch (e) {
-      console.warn("cache purge failed", e);
-    }
-  }
-}
-
-const app = createApp((c): Deps => {
+const app = createReceiverApp((c) => {
   const env = c.env as Env;
-  const ctx = c.executionCtx;
   return {
     config: loadConfig(env),
-    db: new D1Adapter(env.DB),
-    blobs: new R2Adapter(env.MEDIA),
-    cache: new WorkersCache(ctx as ConstructorParameters<typeof WorkersCache>[0]),
-    tasks: { run: (task) => ctx.waitUntil(task().catch((e) => console.error("background task failed", e))) },
+    stores: { media: new R2Adapter(env.MEDIA), data: new R2Adapter(env.DATA) },
     fetch: (input, init) => fetch(input, init),
   };
 });
+app.notFound((c) => (c.env as Env).ASSETS.fetch(c.req.raw));
 
 export default app;

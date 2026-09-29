@@ -1,15 +1,18 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, resolve, sep } from "node:path";
+import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeWebStream } from "node:stream/web";
 import { resolveRange } from "../../core/lib/range";
-import type { BlobBody, BlobObject, BlobPutOptions, BlobStore, ByteRange } from "../../core/ports";
+import { RangeNotSatisfiableError, type BlobBody, type BlobObject, type BlobPutOptions, type BlobStore, type ByteRange } from "../../core/ports";
 
 interface Meta {
   contentType: string;
 }
+
+// 大小 + 修改时间（mtimeMs 带小数，精度到亚毫秒）
+const etagOf = (st: { size: number; mtimeMs: number }) => `"${st.size.toString(16)}-${st.mtimeMs.toString(16)}"`;
 
 /** 本地磁盘实现的 BlobStore：文件按 key 存放，旁边一个 .meta.json 记录类型 */
 export class FsBlobStore implements BlobStore {
@@ -43,21 +46,56 @@ export class FsBlobStore implements BlobStore {
     }
   }
 
+  async create(key: string, body: Uint8Array<ArrayBuffer>, opts: BlobPutOptions): Promise<boolean> {
+    const p = this.path(key);
+    await mkdir(dirname(p), { recursive: true });
+    let handle;
+    try {
+      handle = await open(p, "wx"); // 已存在时原子地失败
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw e;
+    }
+    try {
+      await handle.writeFile(body);
+    } finally {
+      await handle.close();
+    }
+    await writeFile(`${p}.meta.json`, JSON.stringify({ contentType: opts.contentType } satisfies Meta));
+    return true;
+  }
+
+  async head(key: string): Promise<{ size: number; etag: string } | null> {
+    const st = await stat(this.path(key)).catch(() => null);
+    return st?.isFile() ? { size: st.size, etag: etagOf(st) } : null;
+  }
+
   async get(key: string, range?: ByteRange): Promise<BlobObject | null> {
     const p = this.path(key);
     const st = await stat(p).catch(() => null);
     if (!st?.isFile()) return null;
     const meta = JSON.parse(await readFile(`${p}.meta.json`, "utf8").catch(() => "{}")) as Partial<Meta>;
     const r = range ? resolveRange(range, st.size) : null;
-    if (range && !r) return null;
+    if (range && !r) throw new RangeNotSatisfiableError(st.size);
     const stream = createReadStream(p, r ? { start: r.offset, end: r.offset + r.length - 1 } : {});
     return {
       body: Readable.toWeb(stream) as unknown as ReadableStream<Uint8Array>,
       size: st.size,
       contentType: meta.contentType ?? "application/octet-stream",
-      etag: `"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`,
+      etag: etagOf(st),
       range: r ?? undefined,
     };
+  }
+
+  async list(prefix: string): Promise<string[]> {
+    const dir = resolve(this.root, prefix.includes("/") ? prefix.slice(0, prefix.lastIndexOf("/")) : ".");
+    if (!dir.startsWith(this.root)) return [];
+    const entries = await readdir(dir, { recursive: true, withFileTypes: true }).catch(() => []);
+    return entries
+      .filter((e) => e.isFile() && !e.name.endsWith(".meta.json") && !e.name.endsWith(".tmp"))
+      .map((e) => relative(this.root, resolve(e.parentPath, e.name)).split(sep).join("/"))
+      .filter((k) => k.startsWith(prefix))
+      .sort();
   }
 
   async delete(key: string): Promise<void> {
