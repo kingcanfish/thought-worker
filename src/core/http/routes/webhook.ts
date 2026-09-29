@@ -1,6 +1,6 @@
 import { Hono } from "hono";
-import { handleUpdate } from "../../services/ingest";
-import type { TgUpdate } from "../../telegram/types";
+import { storeUpdate } from "../../services/inbox";
+import { deleteCommandNow } from "../../services/instant-delete";
 import type { AppEnv } from "../app";
 
 /** 常量时间比较，避免通过响应时间猜出密钥 */
@@ -13,15 +13,15 @@ function safeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+// 只做校验和存储，处理全部放到构建端；唯一的例外是 /del，要赶在 48 小时内删掉频道里的消息
 export const webhookRoutes = new Hono<AppEnv>().post("/webhook", async (c) => {
-  const deps = c.var.deps;
-  const { botToken, webhookSecret } = deps.config;
-  if (!botToken || !webhookSecret) return c.text("webhook not configured", 503);
-  if (!safeEqual(c.req.header("x-telegram-bot-api-secret-token") ?? "", webhookSecret)) {
+  const { stores, config } = c.var.deps;
+  if (!config.webhookSecret) return c.text("webhook not configured", 503);
+  if (!safeEqual(c.req.header("x-telegram-bot-api-secret-token") ?? "", config.webhookSecret)) {
     return c.text("unauthorized", 401);
   }
-  const update = await c.req.json<TgUpdate>().catch(() => null);
-  if (!update || typeof update !== "object") return c.text("bad request", 400);
-  const result = await handleUpdate(deps, update);
-  return c.json({ ok: true, ...result });
+  const result = await storeUpdate(stores.data, await c.req.text());
+  if (!result.ok) return c.text(result.reason, result.status);
+  await deleteCommandNow(c.var.deps, result.update);
+  return c.json({ ok: true });
 });

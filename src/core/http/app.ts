@@ -1,28 +1,24 @@
 import { Hono, type Context } from "hono";
-import type { Deps } from "../ports";
-import { apiRoutes } from "./routes/api";
+import type { ReceiverDeps } from "../ports";
 import { mediaRoutes } from "./routes/media";
-import { notFoundPage, pageRoutes } from "./routes/pages";
 import { webhookRoutes } from "./routes/webhook";
 
-export type AppEnv = { Variables: { deps: Deps } };
+export type AppEnv = { Variables: { deps: ReceiverDeps } };
 
 /**
- * 与平台无关的应用。resolveDeps 由适配器提供：
- * Cloudflare 按请求从 env / ctx 构造，Node 直接返回同一份实例。
+ * 接收端：只有两个动态路由，其余都是构建出来的静态文件（由平台直接提供）。
+ *   POST /tg/webhook  校验后把 update 原样存进收件箱（data 存储）
+ *   GET  /m/*         MEDIA_BASE=/m 时转发媒体存储里的文件
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function createApp(resolveDeps: (c: Context<any>) => Deps) {
+export function createReceiverApp(resolveDeps: (c: Context<any>) => ReceiverDeps) {
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     c.set("deps", resolveDeps(c));
     await next();
   });
   app.route("/tg", webhookRoutes);
-  app.route("/api", apiRoutes);
   app.route("/m", mediaRoutes);
-  app.route("/", pageRoutes);
-  app.notFound(notFoundPage);
   app.onError((err, c) => {
     console.error(c.req.method, c.req.path, err);
     return c.text("Internal Server Error", 500);
