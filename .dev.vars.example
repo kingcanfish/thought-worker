@@ -1,5 +1,4 @@
 # wrangler dev 用：复制为 .dev.vars
-BOT_TOKEN=123456:ABC-your-bot-token
 WEBHOOK_SECRET=random-long-string
-CHANNEL_ID=-1001234567890
-CHANNEL_USERNAME=your_channel
+# 可选：/del 立即删除频道消息
+# BOT_TOKEN=123456:ABC-your-bot-token
