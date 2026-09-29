@@ -1,8 +1,11 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { loadConfig } from "../src/core/config";
 import { createNodeServer } from "../src/adapters/node";
+import { FsBlobStore } from "../src/adapters/node/fs-store";
+import { runBuild, type BuildOptions } from "../src/build/pipeline";
+import type { SiteIndex } from "../src/core/build/site";
+import { loadConfig } from "../src/core/config";
 import type { TgMessage, TgUpdate } from "../src/core/telegram/types";
 
 export const CHANNEL_ID = -1001234567890;
@@ -22,6 +25,10 @@ export function pngBytes(width: number, height: number): Uint8Array<ArrayBuffer>
 export function fakeFetch() {
   const calls: { url: string; body: unknown }[] = [];
   const pages = new Map<string, () => Response>();
+  /** 下载这些 file_id 时返回 500，模拟网络故障 */
+  const failing = new Set<string>();
+  /** 这些网页延迟返回（毫秒），模拟慢站点 */
+  const delays = new Map<string, number>();
   const fn: typeof fetch = async (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
@@ -33,36 +40,69 @@ export function fakeFetch() {
       return Response.json({ ok: true, result: { file_id: id, file_unique_id: `u-${id}`, file_size: 64, file_path: `files/${id}.jpg` } });
     }
     if (method === "deleteMessages") return Response.json({ ok: true, result: true });
-    if (url.startsWith(`${API}/file/botTOKEN/`)) {
+    const file = /\/file\/botTOKEN\/files\/(.+)\.jpg$/.exec(url)?.[1];
+    if (file !== undefined) {
+      if (failing.has(file)) return new Response("boom", { status: 500 });
       const bytes = pngBytes(100, 80);
       return new Response(bytes, { headers: { "content-length": String(bytes.byteLength) } });
     }
     const page = pages.get(url);
-    if (page) return page();
+    if (page) {
+      const ms = delays.get(url);
+      if (ms) await new Promise((r) => setTimeout(r, ms));
+      return page();
+    }
     return new Response("not found", { status: 404 });
   };
-  return { fn, calls, pages };
+  return { fn, calls, pages, failing, delays };
 }
 
-export function createTestServer(env: Record<string, string> = {}) {
+export function createTestEnv(env: Record<string, string> = {}) {
   const dir = mkdtempSync(join(tmpdir(), "thought-worker-"));
   const fake = fakeFetch();
-  const server = createNodeServer({
-    config: loadConfig({
-      BOT_TOKEN: "TOKEN",
-      WEBHOOK_SECRET: SECRET,
-      CHANNEL_ID: String(CHANNEL_ID),
-      CHANNEL_USERNAME: "mychan",
-      TELEGRAM_API_BASE: API,
-      ...env,
-    }),
-    dbPath: ":memory:",
-    mediaDir: join(dir, "media"),
-    migrationsDir: resolve("migrations"),
-    publicDir: "./public",
-    fetch: fake.fn,
+  const config = loadConfig({
+    BOT_TOKEN: "TOKEN",
+    WEBHOOK_SECRET: SECRET,
+    CHANNEL_ID: String(CHANNEL_ID),
+    CHANNEL_USERNAME: "mychan",
+    TELEGRAM_API_BASE: API,
+    SITE_URL: "https://site.test",
+    ...env,
   });
-  return { ...server, fake, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  const stores = { media: new FsBlobStore(join(dir, "media")), data: new FsBlobStore(join(dir, "private")) };
+  const siteDir = join(dir, "site");
+  const server = createNodeServer({ config, stores, fetch: fake.fn, siteDir });
+
+  const send = (update: TgUpdate, secret = SECRET) =>
+    server.request("/tg/webhook", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": secret },
+      body: JSON.stringify(update),
+    });
+
+  const build = (opts: Partial<BuildOptions> = {}) =>
+    runBuild({
+      config,
+      stores,
+      fetch: fake.fn,
+      outDir: siteDir,
+      publicDir: resolve("public"),
+      migrationsDir: resolve("migrations"),
+      log: () => {},
+      ...opts,
+    });
+
+  const file = (path: string) => readFileSync(join(siteDir, path), "utf8");
+  const exists = (path: string) => existsSync(join(siteDir, path));
+  const index = () => JSON.parse(file("data/index.json")) as SiteIndex;
+  /** 某条帖子渲染出的 HTML（从按月分块里取） */
+  const postHtml = (id: number) => {
+    const entry = index().posts.find((p) => p.id === id);
+    if (!entry) return null;
+    return (JSON.parse(file(`data/month/${entry.d.slice(0, 7)}.json`)) as Record<string, string>)[id] ?? null;
+  };
+
+  return { dir, config, stores, server, fake, send, build, file, exists, index, postHtml, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 let updateId = 1;
@@ -88,3 +128,9 @@ export function withEntities(text: string): Pick<TgMessage, "text" | "entities">
   for (const m of text.matchAll(/https?:\/\/\S+/g)) entities.push({ type: "url", offset: m.index, length: m[0].length });
   return { text, entities: entities.sort((a, b) => a.offset - b.offset) };
 }
+
+export const photo = (id: string, w = 1280, h = 960) => [
+  { file_id: `${id}-s`, file_unique_id: `${id}-us`, width: 320, height: 240 },
+  { file_id: `${id}-m`, file_unique_id: `${id}-um`, width: 800, height: 600 },
+  { file_id: id, file_unique_id: `${id}-u`, width: w, height: h },
+];
