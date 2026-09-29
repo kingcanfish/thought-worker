@@ -92,7 +92,7 @@ function MediaGrid(props: { media: MediaView[]; postId: number; tgLink: string |
               {props.tgLink && (
                 <div class="too-large">
                   <a href={props.tgLink} target="_blank" rel="noopener">
-                    视频较大 · 在 Telegram 中观看 ↗
+                    {m.kind === "photo" ? "原图较大" : "视频较大"} · 在 Telegram 中查看 ↗
                   </a>
                 </div>
               )}

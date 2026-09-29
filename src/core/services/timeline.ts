@@ -1,15 +1,8 @@
 // 读取侧：时间线、单条、标签、统计。输出与存储无关的视图模型。
-import { addDays, dayKey, dayStart, isDayKey, nowSeconds, tzOffset } from "../lib/time";
+import { addDays, dayKey, dayStart, nowSeconds, tzOffset } from "../lib/time";
 import type { Deps, SqlValue } from "../ports";
 import type { ForwardInfo } from "../telegram/forward";
 import type { MediaKind } from "../telegram/normalize";
-
-export interface PostFilters {
-  tag: string | null;
-  q: string | null;
-  from: string | null;
-  to: string | null;
-}
 
 export interface MediaView {
   kind: MediaKind;
@@ -49,61 +42,11 @@ export interface Page {
   nextCursor: string | null;
 }
 
-const clip = (v: string | null | undefined, max: number): string | null => {
-  const s = v?.trim();
-  return s ? s.slice(0, max) : null;
-};
-
-export function parseFilters(get: (key: string) => string | null | undefined): PostFilters {
-  let from = isDayKey(get("from")) ? get("from")! : null;
-  let to = isDayKey(get("to")) ? get("to")! : null;
-  if (from && !to) to = from;
-  if (to && !from) from = to;
-  if (from && to && from > to) [from, to] = [to, from];
-  return { tag: clip(get("tag"), 64)?.replace(/^#/, "") ?? null, q: clip(get("q"), 100), from, to };
-}
-
-export const hasFilters = (f: PostFilters): boolean => !!(f.tag || f.q || f.from);
-
-export const filterParams = (f: PostFilters): URLSearchParams => {
-  const p = new URLSearchParams();
-  if (f.tag) p.set("tag", f.tag);
-  if (f.q) p.set("q", f.q);
-  if (f.from) p.set("from", f.from);
-  if (f.to && f.to !== f.from) p.set("to", f.to);
-  return p;
-};
-
 const encodeCursor = (p: { createdAt: number; id: number }) => `${p.createdAt}:${p.id}`;
 
 function decodeCursor(c: string | null | undefined): [number, number] | null {
   const m = c ? /^(\d+):(\d+)$/.exec(c) : null;
   return m ? [Number(m[1]), Number(m[2])] : null;
-}
-
-function buildWhere(deps: Deps, f: PostFilters): { where: string[]; params: SqlValue[] } {
-  const where = ["p.deleted = 0"];
-  const params: SqlValue[] = [];
-  const tz = deps.config.siteTz;
-  if (f.tag) {
-    where.push("EXISTS (SELECT 1 FROM post_tags t WHERE t.post_id = p.id AND t.tag = ?)");
-    params.push(f.tag);
-  }
-  if (f.from && f.to) {
-    where.push("p.created_at >= ? AND p.created_at < ?");
-    params.push(dayStart(f.from, tz), dayStart(addDays(f.to, 1), tz));
-  }
-  if (f.q) {
-    // trigram 至少 3 个字符才能命中，更短的用 LIKE
-    if ([...f.q].length >= 3) {
-      where.push("p.id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?)");
-      params.push(`"${f.q.replace(/"/g, '""')}"`);
-    } else {
-      where.push("p.text LIKE ? ESCAPE '\\'");
-      params.push(`%${f.q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`);
-    }
-  }
-  return { where, params };
 }
 
 interface PostRow {
@@ -118,9 +61,11 @@ interface PostRow {
 
 const POST_COLUMNS = "p.id, p.html, p.text, p.created_at, p.edited_at, p.forward, p.tg_message_id";
 
-export async function listPosts(deps: Deps, f: PostFilters, opts: { cursor?: string | null; limit?: number } = {}): Promise<Page> {
-  const limit = Math.min(Math.max(opts.limit ?? deps.config.pageSize, 1), 50);
-  const { where, params } = buildWhere(deps, f);
+/** 按时间倒序分页读取未删除的帖子 */
+export async function listPosts(deps: Deps, opts: { cursor?: string | null; limit?: number } = {}): Promise<Page> {
+  const limit = Math.min(Math.max(Math.floor(opts.limit ?? deps.config.pageSize) || 1, 1), 100);
+  const where = ["p.deleted = 0"];
+  const params: SqlValue[] = [];
   const cursor = decodeCursor(opts.cursor);
   if (cursor) {
     where.push("(p.created_at < ? OR (p.created_at = ? AND p.id < ?))");
@@ -136,15 +81,16 @@ export async function listPosts(deps: Deps, f: PostFilters, opts: { cursor?: str
   return { posts, nextCursor: more && last ? encodeCursor(last) : null };
 }
 
-export async function countPosts(deps: Deps, f: PostFilters): Promise<number> {
-  const { where, params } = buildWhere(deps, f);
-  const row = await deps.db.first<{ n: number }>(`SELECT count(*) AS n FROM posts p WHERE ${where.join(" AND ")}`, params);
-  return row?.n ?? 0;
-}
-
-export async function getPost(deps: Deps, id: number): Promise<PostView | null> {
-  const row = await deps.db.first<PostRow>(`SELECT ${POST_COLUMNS} FROM posts p WHERE p.id = ? AND p.deleted = 0`, [id]);
-  return row ? ((await hydrate(deps, [row]))[0] ?? null) : null;
+/** 全部帖子（构建用），分批读取 */
+export async function listAllPosts(deps: Deps): Promise<PostView[]> {
+  const all: PostView[] = [];
+  let cursor: string | null = null;
+  do {
+    const page: Page = await listPosts(deps, { cursor, limit: 100 });
+    all.push(...page.posts);
+    cursor = page.nextCursor;
+  } while (cursor);
+  return all;
 }
 
 async function hydrate(deps: Deps, rows: PostRow[]): Promise<PostView[]> {

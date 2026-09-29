@@ -2,7 +2,7 @@ import type { Child } from "hono/jsx";
 import type { Config } from "../../config";
 
 /** 改了 public/assets 下的文件就把它加一，让浏览器重新下载 */
-export const ASSET_VERSION = "1";
+export const ASSET_VERSION = "2";
 
 export interface Meta {
   title: string;
@@ -14,10 +14,10 @@ export interface Meta {
 
 const THEME_INIT = `try{var t=localStorage.getItem("theme");if(t)document.documentElement.dataset.theme=t}catch(e){}`;
 
-export function Layout(props: { config: Config; meta: Meta; origin: string; children: Child }) {
+export function Layout(props: { config: Config; meta: Meta; origin: string; buildId?: string; children: Child }) {
   const { config, meta, origin } = props;
   return (
-    <html lang="zh-CN" data-tz={config.siteTz}>
+    <html lang="zh-CN" data-tz={config.siteTz} data-build={props.buildId}>
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />

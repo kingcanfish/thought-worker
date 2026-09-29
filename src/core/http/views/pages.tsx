@@ -1,6 +1,6 @@
 import type { Config } from "../../config";
 import { addDays, weekdayOf } from "../../lib/time";
-import { filterParams, hasFilters, type PostFilters, type PostView } from "../../services/timeline";
+import type { PostView } from "../../services/timeline";
 import { Icon } from "./icons";
 import { Layout, type Meta } from "./layout";
 import { DaySections } from "./post";
@@ -11,19 +11,14 @@ export const HEATMAP_WEEKS = 20;
 export interface HomeData {
   config: Config;
   origin: string;
-  filters: PostFilters;
+  buildId: string;
+  /** 首屏直接渲染的帖子（不开 JS 也能看）；其余由前端从 /data 加载 */
   posts: PostView[];
-  nextCursor: string | null;
-  count: number | null;
+  total: number;
   stats: { posts: number; days: number; media: number };
   tags: { tag: string; count: number }[];
   heatmap: { from: string; to: string; counts: Record<string, number> };
 }
-
-const withFilters = (f: PostFilters, patch: Partial<PostFilters>): string => {
-  const qs = filterParams({ ...f, ...patch }).toString();
-  return qs ? `/?${qs}` : "/";
-};
 
 const fmtMD = (key: string) => {
   const [, m, d] = key.split("-").map(Number);
@@ -44,10 +39,9 @@ function Avatar(props: { config: Config }) {
 }
 
 function Sidebar(props: HomeData) {
-  const { config, stats, tags, heatmap, filters } = props;
+  const { config, stats, tags, heatmap } = props;
   const cells: string[] = [];
   for (let d = heatmap.from; d <= heatmap.to; d = addDays(d, 1)) cells.push(d);
-  const inRange = (d: string) => !!filters.from && d >= filters.from && d <= (filters.to ?? filters.from);
   return (
     <aside>
       <Avatar config={config} />
@@ -74,7 +68,7 @@ function Sidebar(props: HomeData) {
         <div class="heatmap" id="heatmap">
           {cells.map((d) => {
             const c = heatmap.counts[d] ?? 0;
-            return <i data-l={Math.min(c, 4)} data-day={d} class={inRange(d) ? "sel" : undefined} title={`${fmtMD(d)} · ${c ? `${c} 条` : "没有碎碎念"}`} />;
+            return <i data-l={Math.min(c, 4)} data-day={d} title={`${fmtMD(d)} · ${c ? `${c} 条` : "没有碎碎念"}`} />;
           })}
         </div>
         <div class="heatmap-legend">
@@ -93,7 +87,7 @@ function Sidebar(props: HomeData) {
           <p class="section-title">标签</p>
           <div class="tags" id="tags">
             {tags.map((t) => (
-              <a class={`tag-chip${filters.tag === t.tag ? " active" : ""}`} href={withFilters(filters, { tag: filters.tag === t.tag ? null : t.tag })} data-tag={t.tag}>
+              <a class="tag-chip" href={`/?tag=${encodeURIComponent(t.tag)}`} data-tag={t.tag}>
                 #{t.tag}
                 <small>{t.count}</small>
               </a>
@@ -113,50 +107,20 @@ function Sidebar(props: HomeData) {
   );
 }
 
-export function FilterBar(props: { filters: PostFilters; count: number | null }) {
-  const f = props.filters;
-  if (!hasFilters(f)) return null;
-  const date = f.from ? (f.from === f.to ? fmtMD(f.from) : `${fmtMD(f.from)} – ${fmtMD(f.to!)}`) : null;
-  return (
-    <>
-      {props.count !== null && <span>{props.count} 条结果</span>}
-      {date && (
-        <a class="tag-chip" href={withFilters(f, { from: null, to: null })} data-clear="date">
-          {date} ✕
-        </a>
-      )}
-      {f.tag && (
-        <a class="tag-chip" href={withFilters(f, { tag: null })} data-clear="tag">
-          #{f.tag} ✕
-        </a>
-      )}
-      {f.q && (
-        <a class="tag-chip" href={withFilters(f, { q: null })} data-clear="q">
-          “{f.q}” ✕
-        </a>
-      )}
-    </>
-  );
-}
-
-export function TimelineBody(props: { config: Config; filters: PostFilters; posts: PostView[] }) {
+export function TimelineBody(props: { config: Config; posts: PostView[] }) {
   if (props.posts.length) return <DaySections posts={props.posts} config={props.config} />;
-  return <div class="empty">{hasFilters(props.filters) ? "什么也没找到 ¯\\_(ツ)_/¯" : "还没有碎碎念，去频道里发一条吧。"}</div>;
+  return <div class="empty">还没有碎碎念，去频道里发一条吧。</div>;
 }
 
-function Toolbar(props: { filters: PostFilters }) {
-  const f = props.filters;
+function Toolbar() {
   return (
     <div class="toolbar">
       <form class="search" action="/" method="get" role="search">
         <Icon name="search" size={16} />
-        <input id="q" name="q" type="search" placeholder="搜索碎碎念…" autocomplete="off" value={f.q ?? ""} />
-        {f.tag && <input type="hidden" name="tag" value={f.tag} />}
-        {f.from && <input type="hidden" name="from" value={f.from} />}
-        {f.to && <input type="hidden" name="to" value={f.to} />}
+        <input id="q" name="q" type="search" placeholder="搜索碎碎念…" autocomplete="off" />
       </form>
       <div class="cal-wrap">
-        <button type="button" class={`icon-btn${f.from ? " on" : ""}`} id="cal-btn" title="按日期筛选" aria-label="按日期筛选" aria-expanded="false">
+        <button type="button" class="icon-btn" id="cal-btn" title="按日期筛选" aria-label="按日期筛选" aria-expanded="false">
           <Icon name="calendar" />
         </button>
         <div class="sheet-mask" id="mask" />
@@ -221,28 +185,23 @@ function Overlays() {
 }
 
 export function HomePage(props: HomeData) {
-  const { config, origin, filters, posts, nextCursor } = props;
-  const meta: Meta = {
-    title: filters.tag ? `#${filters.tag} · ${config.siteTitle}` : config.siteTitle,
-    description: config.siteDescription,
-    url: `${origin}${withFilters(filters, {})}`,
-  };
+  const { config, origin, posts } = props;
+  const meta: Meta = { title: config.siteTitle, description: config.siteDescription, url: `${origin}/` };
+  const more = props.total > posts.length;
   return (
-    <Layout config={config} meta={meta} origin={origin}>
+    <Layout config={config} meta={meta} origin={origin} buildId={props.buildId}>
       <div class="shell">
         <Sidebar {...props} />
         <main>
           <div class="topbar" id="topbar">
-            <Toolbar filters={filters} />
-            <div class="filter-bar" id="filter">
-              <FilterBar filters={filters} count={props.count} />
-            </div>
+            <Toolbar />
+            <div class="filter-bar" id="filter" />
           </div>
-          <div id="timeline" data-next={nextCursor ?? ""}>
-            <TimelineBody config={config} filters={filters} posts={posts} />
+          <div id="timeline">
+            <TimelineBody config={config} posts={posts} />
           </div>
           <div class="end" id="end">
-            {nextCursor ? "加载中…" : posts.length ? "— 到底啦 —" : ""}
+            {more ? "加载中…" : posts.length ? "— 到底啦 —" : ""}
           </div>
         </main>
       </div>
@@ -251,7 +210,7 @@ export function HomePage(props: HomeData) {
   );
 }
 
-export function PostPage(props: { config: Config; origin: string; post: PostView; image: string | null; description: string }) {
+export function PostPage(props: { config: Config; origin: string; buildId: string; post: PostView; image: string | null; description: string }) {
   const { config, origin, post } = props;
   const meta: Meta = {
     title: `${props.description ? `${props.description.slice(0, 30)} · ` : ""}${config.siteTitle}`,
@@ -261,7 +220,7 @@ export function PostPage(props: { config: Config; origin: string; post: PostView
     type: "article",
   };
   return (
-    <Layout config={config} meta={meta} origin={origin}>
+    <Layout config={config} meta={meta} origin={origin} buildId={props.buildId}>
       <div class="single">
         <header class="single-head">
           <a href="/" class="back">
