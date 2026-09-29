@@ -1,0 +1,19 @@
+{
+  // 核心代码 + Node 适配器 + 脚本 + 测试；核心只依赖标准 Web API
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "hono/jsx"
+  },
+  "include": ["src/core", "src/adapters/node", "scripts", "test"]
+}

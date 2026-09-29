@@ -1,0 +1,33 @@
+name = "thought-worker"
+main = "src/adapters/cloudflare/index.ts"
+compatibility_date = "2026-09-01"
+
+# css / js 等静态文件，直接由 Cloudflare 提供
+[assets]
+directory = "./public"
+
+# Workers Cache：页面按 Cache-Control 缓存，发帖时按 Cache-Tag 清除。
+# 注意：开启后静态文件请求也会计入 Workers 请求数；想关掉就删掉这一段，代码不用改。
+[cache]
+enabled = true
+
+[vars]
+SITE_TITLE = "碎碎念"
+SITE_DESCRIPTION = "一些不成文的想法、路上拍的照片，和偶尔的抱怨。同步自 Telegram。"
+SITE_AVATAR = "念"
+SITE_TZ = "Asia/Shanghai"
+MEDIA_BASE = "/m"
+# 频道 ID（-100 开头）和公开频道的 @用户名（不带 @）
+CHANNEL_ID = ""
+CHANNEL_USERNAME = ""
+# BOT_TOKEN、WEBHOOK_SECRET 用 `wrangler secret put` 设置，本地开发写在 .dev.vars
+
+[[d1_databases]]
+binding = "DB"
+database_name = "thought-worker"
+database_id = "00000000-0000-0000-0000-000000000000" # 替换成 `wrangler d1 create thought-worker --location apac` 输出的 id
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "thought-worker-media"

@@ -1,0 +1,9 @@
+{
+  // Cloudflare 适配器单独检查：Workers 类型和 DOM / Node 类型互相冲突
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023"],
+    "types": ["@cloudflare/workers-types"]
+  },
+  "include": ["src/core", "src/adapters/cloudflare"]
+}
