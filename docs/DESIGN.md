@@ -1,6 +1,6 @@
-# Thought Worker · 技术方案 & PRD（v0.3，已实现）
+# Thought Worker · 技术方案 & PRD（v0.4，静态站点）
 
-> 一句话：在 Telegram Channel 里发碎碎念，Bot 通过 Webhook 把内容（文字 / 图片 / 视频）同步进 Cloudflare，再由一个简约的网页渲染出来。
+> 一句话：在 Telegram Channel 里发碎碎念，Bot 通过 Webhook 把消息存进收件箱，每天定时构建一次静态网站。
 
 ---
 
@@ -16,13 +16,14 @@
 
 | 优先级 | 功能 | 说明 |
 | --- | --- | --- |
-| P0 | Webhook 接收频道消息 | 文字、单图、多图相册、视频、GIF |
+| P0 | Webhook 接收频道消息 | 文字、单图、多图相册、视频、GIF；接收端只存原始消息 |
 | P0 | 媒体转存 | 从 Telegram 下载，存进 R2，网页不依赖 Telegram |
-| P0 | 时间线页 | 倒序、按天分组、游标分页（无限滚动） |
+| P0 | 时间线页 | 倒序、按天分组、无限滚动 |
 | P0 | 富文本还原 | 粗体 / 斜体 / 链接 / 代码 / 引用 / 剧透 等 Telegram entities |
-| P0 | 编辑同步 | 频道里编辑消息，网页同步更新 |
+| P0 | 编辑同步 | 频道里编辑消息，下次构建后网页更新 |
+| P0 | 每日构建 | 每天定时构建一次，没有新消息不构建；可手动触发（见 §2.3） |
 | P1 | 标签 | `#标签` 自动提取，侧栏标签云 + 点击筛选 |
-| P1 | 搜索 | D1 FTS5 全文检索 |
+| P1 | 搜索 | 前端在索引里做子串匹配，中文友好 |
 | P1 | 单条详情页 | `/p/:id`，可分享，带 OG 预览图 |
 | P1 | 删除 | Bot API 收不到删除事件 → 在频道里回复 `/del`（见 §4.4） |
 | P1 | 转发来源 | 转发的消息正常展示，并标注「转发自 xxx」（见 §4.7） |
@@ -39,121 +40,106 @@
 - 不做评论、点赞、多用户。
 - 不做私密条目 / 登录（站点完全公开）。
 - 不导入 Bot 接入之前的频道历史，从接入之后开始记录。
+- 不追求实时：发帖后最晚第二天构建时出现在网站上（需要时可以手动触发构建）。
 
 ---
 
 ## 2. 整体架构
 
 ```
- ┌──────────────┐  channel_post / edited_channel_post
- │ Telegram     │ ─────────────────────────────────┐
- │ Channel + Bot│                                  │ HTTPS Webhook
- └──────────────┘                                  ▼   (X-Telegram-Bot-Api-Secret-Token)
-                                   ┌────────────────────────────────┐
-                                   │ Cloudflare Worker (Hono)       │
-                                   │                                │
-                                   │  POST /tg/webhook  入库+转存    │
-                                   │  GET  /api/posts   JSON 接口    │
-                                   │  GET  /m/:key      R2 媒体代理  │
-                                   │  GET  /  /p/:id  /rss.xml  SSR  │
-                                   │  static assets (css/js)        │
-                                   └──────┬──────────────┬──────────┘
-                                          │              │
-                                   ┌──────▼─────┐  ┌─────▼──────┐
-                                   │ D1 (SQLite)│  │ R2 (对象)   │
-                                   │ 帖子/媒体元 │  │ 图片/视频   │
-                                   └────────────┘  └────────────┘
+ Telegram 频道 ──webhook──▶ 接收端（Worker，几十行）
+                              │ 校验密钥，原样存进 R2：inbox/<update_id>.json
+                              ▼
+       ┌──────── R2: thought-worker-data（私有）───────┐  ┌── R2: thought-worker-media（可公开）──┐
+       │ inbox/  收件箱   state/thought.db  数据库     │  │ photo/ video/ gif/ thumb/ link/        │
+       │ state/build.lock  构建锁                      │  │                                        │
+       └───────────────────────▲──────────────────────┘  └───────────────────▲────────────────────┘
+                                             │ S3 API
+ 每天 04:00（GitHub Actions） ──▶ 构建端 ─────┴─────────────────────────────────────────┘
+   加锁 → 取回数据库 → 重试之前失败的媒体 → 处理收件箱（入库 / 转存媒体 / /del）→ 链接预览
+   → 没有变化就结束 → 渲染整站静态文件 → wrangler deploy → 核对后回写数据库、清空收件箱 → 解锁
+
+ 访客 ──▶ 静态文件（Workers Static Assets，不执行代码）；/m/* 媒体经 Worker 读 R2
 ```
 
-**只部署一个 Worker**，同时承担 Webhook、API、媒体代理和页面渲染，运维最省事。
+**接收和构建分开**：
+
+- **接收端**只做校验和存储，不解析内容、不连数据库，攻击面只有一个接口；Telegram 的推送立刻落盘，不受「未取走的更新只保留 24 小时」的限制。唯一的例外是 `/del`：立即调用 `deleteMessages` 删掉指令和被回复的消息（见 §4.4）。
+- **两个桶**：媒体桶可以整体公开（绑定自定义域名直出）；收件箱、数据库、构建锁放在私有的数据桶，任何情况下都不能被外部读到。
+- **构建端**每天跑一次，把积压的消息一次处理完；没有新消息就什么都不做。部署成功后才回写数据库和清空收件箱，任何一步失败，下次构建会重新处理（入库是幂等的）。
+- **网站是纯静态文件**：没有服务端渲染、没有查询接口、没有缓存失效问题；筛选、搜索、分页在浏览器里基于构建生成的索引完成。
 
 ### 2.1 选型
 
 | 层 | 选型 | 理由 |
 | --- | --- | --- |
-| 运行时 | Cloudflare Workers | 免费 10 万请求 / 天，个人站绰绰有余 |
-| 路由框架 | Hono | 轻、原生支持 Workers、自带 JSX 可做 SSR |
-| 数据库 | D1 | SQLite，免费 5GB，支持 FTS5 全文检索 |
-| 媒体存储 | R2 | 免费 10GB 存储、**出站流量免费** |
-| 前端 | Hono JSX 服务端渲染 + 少量原生 JS | 首屏快、利于 SEO/分享；交互（灯箱、无限滚动、主题）用几百行原生 JS |
-| 缓存 | Workers Cache | 页面按「静态页」缓存，发帖时按标签清除（见 §2.3） |
-| 静态资源 | Workers Static Assets | 和 Worker 同一次部署 |
-| 部署 | Wrangler + GitHub Actions | `wrangler deploy` |
-
-> 备选：如果后面前端交互变复杂，可以把前端换成 Astro（仍部署在 Workers），API 不变。
+| 接收端 + 托管 | Cloudflare Workers + Static Assets | 静态文件请求免费且不计次数；只有 webhook 和媒体会执行 Worker |
+| 数据 | SQLite 文件（存在私有的数据桶） | 构建时下载、构建完上传；不需要 D1，自建时就是本地文件 |
+| 媒体 / 收件箱 | 两个 R2 桶 | 免费 10GB、出站流量免费；构建端通过 S3 API 访问 |
+| 构建 | GitHub Actions 定时任务 | 公开仓库免费；完整 Node 环境；可手动触发 |
+| 渲染 | Hono JSX（构建时渲染成 HTML） | 同一套模板，不开 JS 也能看首屏和详情页 |
+| 前端交互 | 原生 JS（`public/assets/app.js`） | 无构建步骤 |
 
 ### 2.2 免费额度评估
 
-| 资源 | 免费额度 | 预估用量（每天发 20 条、1k PV） |
+| 资源 | 免费额度 | 预估用量（每天发 20 条、1k 次访问） |
 | --- | --- | --- |
-| Workers 请求 | 100k / 天 | 页面 + 媒体请求 ~ 16k（Workers Cache 命中也计入请求数，但不耗 CPU、不查 D1；静态资源不计入） |
-| Workers CPU | 10ms / 请求 | 渲染 + 查询约 2~5ms；下载转存主要是 I/O 等待，不计 CPU |
-| D1 | 5GB、500 万行读 / 天 | 远低于 |
-| R2 存储 | 10GB | 主要瓶颈，视频多了要注意（见 §4.6） |
-| R2 A 类 / B 类操作 | 100 万 / 1000 万 每月 | 远低于 |
+| Workers 请求 | 10 万 / 天 | 页面、数据、css/js 都是静态文件，**不计**；只有媒体（`/m`）和 webhook 计入 ≈ 1.5 万 |
+| R2 存储 | 10GB | 主要瓶颈，看视频多少（见 §4.6） |
+| R2 操作 | A 类 100 万 / B 类 1000 万 每月 | 每天一次构建 + 媒体读取，远低于 |
+| GitHub Actions | 公开仓库不限分钟 | 每天一次，几十秒 |
+| Workers Static Assets | 单个版本 20000 个文件、单文件 25MB | 每条帖子一个详情页，约 2 万条后需要调整（例如详情页分目录合并） |
 
 ⚠️ R2 需要在 Cloudflare 账户绑定支付方式才能开通（免费额度内不扣费）。
 
-**请求数是第一个会碰到的上限**，主要被图片视频吃掉：
-
-| 阶段 | 一次访问消耗的 Worker 请求 | 每天可承载 |
-| --- | --- | --- |
-| 现在：媒体经 Worker 转发（`MEDIA_BASE=/m`） | 1 页面 + 首屏约 15 张图 ≈ 16 | ≈ 6000 次访问 |
-| 域名迁入后：媒体由 R2 自定义域名直出 | 1~2（页面 / 接口） | ≈ 5 万次访问以上 |
-
-- 回访者的浏览器缓存会让实际消耗更低；按 1k 次访问 / 天只用到约 16%。
-- 超出免费额度不会扣费：当天剩余请求返回错误 1027，次日自动恢复。
-- CPU 不是瓶颈；存储（10GB）取决于视频数量。
+- 媒体经 Worker 转发时，一次访问约 15 个请求，每天约可承载 6000 次访问；域名迁入后媒体改由 R2 自定义域名直出，就不再占 Worker 请求。
+- 超出免费额度不会扣费：当天剩余的 Worker 请求返回错误 1027，次日恢复；静态页面不受影响。
 
 ### 2.2.1 访问速度
 
-- **无冷启动**：Worker 启动只要几毫秒；缓存命中时直接从最近的节点返回，海外首字节通常几十毫秒。
-- **D1 就近放**：创建时指定 `--location apac`（亚太），未命中缓存时查询延迟更低。
-- **图片按尺寸取**：Telegram 会给每张图生成多个尺寸，转存时同时存中等尺寸（约 800px）做缩略图，时间线用缩略图，灯箱再加载原图。
-- ⚠️ **中国大陆**：`*.workers.dev`（以及 `*.r2.dev`）在大陆基本无法直接访问；绑定自定义域名后可以访问，但 Cloudflare 免费版在大陆没有节点，会绕行香港 / 美西，延迟约 150~300ms+，随运营商和时段波动。真正的大陆加速需要 ICP 备案 + 国内 CDN，不在免费范围内。**所以域名迁入 Cloudflare 的优先级要提前。**
+- **静态文件**：直接由 Cloudflare 边缘节点返回，不执行代码、不查数据库。
+- **按需加载**：首屏帖子直接写在 HTML 里；筛选 / 翻页用的索引（`data/index.json`）和按月分块的帖子 HTML 按需加载。
+- **图片按尺寸取**：Telegram 会给每张图生成多个尺寸，转存时同时存中等尺寸（约 720px 以上的一档）做缩略图，时间线用缩略图，灯箱再加载原图。
+- ⚠️ **中国大陆**：`*.workers.dev`（以及 `*.r2.dev`）在大陆基本无法直接访问；绑定自定义域名后可以访问，但 Cloudflare 免费版在大陆没有节点，延迟约 150~300ms+。真正的大陆加速需要 ICP 备案 + 国内 CDN，不在免费范围内。**所以域名迁入 Cloudflare 的优先级要提前。**
 
-### 2.3 渲染方式：动态渲染 + 缓存，不做静态生成
+### 2.3 构建时机：每天一次，有新内容才构建
 
-页面由 Worker 在请求时查 D1、渲染 HTML，但通过缓存让访客拿到的效果和静态页一样。**不做「每发一条就重新生成整站静态文件」**，原因：
+| 触发 | 行为 |
+| --- | --- |
+| 定时（每天 04:00 上海） | 收件箱为空、也没有待重试的媒体 → 直接结束；否则构建并部署 |
+| 手动（Actions 页面 Run workflow） | 强制构建，想让刚发的帖子马上出现时用 |
+| 推送代码到 `main` | 强制构建（模板 / 样式改了需要重新生成） |
 
-- **发布慢**：静态生成要跑一次构建 + 部署，几十秒到几分钟后才能看到新帖；Pages 免费每月 500 次构建，一天发 20 条就超了。
-- **省不掉后端**：搜索、标签、日期筛选、无限滚动本来就要查接口，Worker + D1 无论如何都在。
-- **页面本来就一样**：时区固定为上海后，所有访客看到的 HTML 完全相同，天然适合缓存。
-
-缓存策略（Workers Cache，`wrangler.toml` 里 `[cache] enabled = true`）：
-
-| 内容 | 缓存 | 失效 |
-| --- | --- | --- |
-| 页面 HTML、`/api/*`、`/rss.xml` | `Cache-Control: public, max-age=86400`，并带 `Cache-Tag: content` | 收到新帖 / 编辑 / `/del` 后，webhook 里调用 `ctx.cache.purge({ tags: ["content"] })` |
-| 媒体 `/m/:key` | `max-age=31536000, immutable` | 永不失效（key 按文件内容唯一） |
-| css / js | Workers Static Assets，文件名带 hash | 随部署更新 |
-
-效果：平时访问全部命中缓存，不执行 Worker 代码、不查 D1；发帖后第一个访客触发一次渲染，之后又回到缓存。
-
-> Workers Cache 是比较新的能力，M1 阶段先验证它在免费套餐 + `workers.dev` 上的表现；如果不符合预期，退回到「HTML 缓存 60 秒」的短 TTL 方案，按当前访问量不缓存也在免费额度内。
+- 一个月最多约 30 次定时构建；部署用 `wrangler deploy` 直接上传，不占 Pages 的构建额度。
+- **同一时间只跑一个构建**，三道保护：
+  1. GitHub Actions 的 `concurrency` 分组；
+  2. 构建锁 `state/build.lock`：用「不存在才创建」（R2 / S3 的 `If-None-Match: *`，本地磁盘的 `O_EXCL`）拿锁，锁里放随机令牌，拿到后读回核对；超过 1 小时的锁视为异常退出留下的，可以接管；
+  3. 回写前核对锁令牌仍是自己的、数据库的 ETag 与下载时一致，否则放弃回写（下次构建重新处理）。
+  即使存储不支持条件写入（部分 S3 兼容服务），第 3 道也能保证不会用旧库覆盖新库。
+- 为什么不是「每天拉一次 getUpdates」：Telegram 未取走的更新最多保留 24 小时，每天拉一次正好卡在边界上，定时任务一延迟就会丢消息；webhook + 收件箱没有这个问题。
 
 ### 2.4 可移植性：核心与平台解耦
 
-后续可能迁到自己的服务器，所以业务代码不直接依赖 Cloudflare API：
-
 ```
 src/core/            只用标准 Web API（fetch / Streams / Web Crypto / Intl）+ Hono
-  ports.ts           平台接口：Database（SQLite 方言）/ BlobStore / ResponseCache / BackgroundTasks
+  ports.ts           平台接口：Database（SQLite 方言）/ BlobStore / BackgroundTasks
+  build/site.tsx     数据库 → 静态文件
+src/build/           构建流程（Node）：存储选择、取回 / 回写数据库、部署
 src/adapters/
-  cloudflare/        D1 · R2 · Workers Cache · ctx.waitUntil
-  node/              node:sqlite · 本地磁盘 · 进程内响应缓存 · 游离 Promise
+  cloudflare/        接收端 Worker（R2 binding）
+  node/              自建服务器（接收端 + 静态文件）· node:sqlite · 本地磁盘
+  s3/                S3 兼容存储（R2 / MinIO / AWS S3）
 ```
 
-| 接口 | Cloudflare | 自建服务器（Node） |
+| | Cloudflare | 自建服务器 |
 | --- | --- | --- |
-| `Database` | D1 | `node:sqlite`（内置，无原生依赖），迁移记录表与 wrangler 的 `d1_migrations` 一致 |
-| `BlobStore` | R2（`FixedLengthStream` 流式写入） | 本地磁盘（以后可加 S3 / MinIO 实现） |
-| `ResponseCache` | Workers Cache 按 `Cache-Tag` 清除 | 进程内缓存，语义相同；前面有 nginx / CDN 时可按同样的响应头缓存 |
-| `BackgroundTasks` | `ctx.waitUntil` | 不 await 的 Promise |
+| 接收端 | Worker，两个 R2 binding（`MEDIA` / `DATA`） | Node 服务，本地磁盘 `media/` + `private/`（或 S3 两个桶） |
+| 构建 | GitHub Actions，`STORAGE=r2`，`DEPLOY_COMMAND=npx wrangler deploy` | 系统 cron，`STORAGE=fs`，直接写到服务目录 |
+| 托管 | Workers Static Assets | 同一个 Node 服务（或 nginx） |
 
-- 平台特有能力都有通用替代：链接预览不用 `HTMLRewriter`，改用 `fetch` + 正则解析 meta；图片尺寸从文件头读取，不依赖图片库。
-- 两个适配器跑同一套端到端测试（Node 适配器 + 假 Telegram API），并用 `wrangler dev` 验证过 Workers 运行时。
-- 数据可以直接搬：D1 导出的就是 SQLite 文件，R2 里的对象按 key 平铺，拷到 `data/media/` 即可。
+- 平台特有能力都有通用替代：链接预览用 `fetch` + 正则解析 meta（不用 `HTMLRewriter`）；图片尺寸从文件头读取。
+- 已验证：Node + 本地磁盘、Node + S3 兼容服务（Zenko CloudServer，校验签名）、`wrangler dev`（Workers 运行时）、Docker 镜像。
+- 数据可以直接搬：数据库就是一个 SQLite 文件，对象按 key 平铺，媒体拷到 `data/media/`、收件箱和数据库拷到 `data/private/` 即可。
 
 ---
 
@@ -170,7 +156,7 @@ src/adapters/
      -d secret_token=$WEBHOOK_SECRET \
      -d 'allowed_updates=["channel_post","edited_channel_post"]'
    ```
-4. Worker 里配置 `CHANNEL_ID`（形如 `-100xxxxxxxxxx`），只处理来自这个频道的更新；配置 `CHANNEL_USERNAME`（公开频道的 @用户名），用于生成 `t.me/<username>/<message_id>` 回链。
+4. `site.env` 里配置 `CHANNEL_ID`（形如 `-100xxxxxxxxxx`），构建时只处理来自这个频道的更新；配置 `CHANNEL_USERNAME`（公开频道的 @用户名），用于生成 `t.me/<username>/<message_id>` 回链。
 5. 域名迁到 Cloudflare 后，需要用新域名重新调用一次 `setWebhook`（见 §4.5）。
 
 ### 3.2 需要处理的更新
@@ -198,24 +184,33 @@ src/adapters/
 
 ## 4. 关键设计
 
-### 4.1 Webhook 处理流程
+### 4.1 接收与构建流程
 
 ```
-POST /tg/webhook
+POST /tg/webhook（接收端）
  ├─ 校验 header X-Telegram-Bot-Api-Secret-Token == WEBHOOK_SECRET  否则 401
- ├─ 校验 chat.id == CHANNEL_ID                                   否则 200 忽略
- ├─ 解析消息 → 归一化为 { groupKey, messageId, text, entities, media[] }
- ├─ D1 upsert post / message（幂等：以 (chat_id, message_id) 为唯一键）
- ├─ 对每个 media：getFile → 流式 fetch → R2.put（key 用 file_unique_id，天然去重）
- ├─ 更新 media.status = ready
- └─ 返回 200
+ ├─ 校验是合法 JSON、带 update_id、不超过 1MB                     否则 400 / 413
+ └─ 原样写入 inbox/<补零的 update_id>.json，返回 200
+    （update_id 单调递增，按 key 排序就是投递顺序；重复投递写同一个 key）
+
+构建端（每天一次）
+ ├─ 加锁（state/build.lock）
+ ├─ 下载 state/thought.db（没有就新建）并记下 ETag，执行迁移
+ ├─ 重试之前 status = failed 的媒体（最多 5 次；先于新消息，刚失败的不会在同一次构建里重复下载）
+ ├─ 按顺序处理 inbox/*：校验 chat.id == CHANNEL_ID → 归一化 → 入库（幂等）
+ │    ├─ 媒体：getFile → 下载 → 写入媒体桶（key 用 file_unique_id，天然去重）
+ │    └─ /del：软删帖子，删除频道里的指令和整个相册
+ ├─ 链接预览：这一批里有变化的纯文字帖，每个帖子按最后一次编辑抓一次（并行）
+ ├─ 收件箱为空且没有重试成功 → 不渲染；若尝试过重试，仍回写数据库（记录重试次数）
+ ├─ 渲染到临时目录，整体替换输出目录
+ ├─ 部署（DEPLOY_COMMAND）
+ ├─ 核对锁令牌和数据库 ETag
+ └─ 上传数据库、删除已处理的收件箱文件、解锁
 ```
 
-- **同步处理，失败返回 5xx**：Telegram 会自动重试，配合幂等 upsert 不会产生重复数据。
-- **例外：单个媒体下载失败只标记 `failed`，照常返回 200**。Telegram 的更新是按顺序投递的，一条消息一直失败会堵住后面所有更新；失败的媒体在这条消息下次被编辑时会重试。
+- **失败即重来**：部署成功前不回写任何东西；中途失败，下次构建把同一批消息重新处理一遍。
+- **单个媒体下载失败**只标记 `failed`，不影响整批构建；之后每次构建自动重试（用保存的 `file_id`，它对 bot 长期有效）。
 - 同一个文件（`file_unique_id`）在别的帖子里转存过就直接复用。
-- **流式转存**：`fetch(fileUrl).body` 直接喂给 `R2.put`，不在内存里缓冲整个视频。
-- 如果后续发现处理时间过长，可以改成「先落库返回 200，再用 Cloudflare Queues 异步转存」。
 
 ### 4.2 相册（media group）合并
 
@@ -225,7 +220,7 @@ Telegram 发多图时，**每张图是一条独立消息、各自一次 webhook*
 - `posts` 以 `(chat_id, group_key)` 唯一；每次来一张图就 `INSERT ... ON CONFLICT DO NOTHING` 再查出 post_id。
 - 媒体按 `message_id` 升序展示，保证顺序与 Telegram 一致。
 - 帖子文字取「有 caption 的那条」；编辑某条的 caption 时更新帖子文字。
-- D1 写入是串行的，并发的几个 webhook 不会出现竞争写坏。
+- 构建时按 update_id 顺序逐条处理，相册的几条消息不会并发写入。
 
 ### 4.3 富文本渲染
 
@@ -249,6 +244,8 @@ channel_post: text 以 bot_command "/del" 开头 且 带 reply_to_message
 - 一次操作同时删掉网页和频道里的内容，不用再去频道手动删。
 - `/del` 没有回复任何消息时直接忽略（同样删掉指令）。
 - 软删不删 R2 文件，误删可以在数据库里改回来；以后可以加一个定时任务清理软删超过 30 天的媒体。
+- **接收端立即删除**：bot 只能删 48 小时内的消息，等每天一次的构建可能来不及，所以接收端收到 `/del` 时马上删掉指令和被回复的那条（需要 Worker 配 `BOT_TOKEN` secret 和 `CHANNEL_ID` 变量；不配就全部留给构建）。
+- 网站上的隐藏、相册里其余消息的删除仍在构建时处理；想让网站立刻更新就手动触发一次构建。
 
 ### 4.5 媒体访问
 
@@ -258,16 +255,16 @@ channel_post: text 以 bot_command "/del" 开头 且 带 reply_to_message
 
 | 阶段 | `MEDIA_BASE` | 说明 |
 | --- | --- | --- |
-| 现在（默认） | `/m` | Worker 从 R2 读取并返回，`Cache-Control: public, max-age=31536000, immutable`，由 Workers Cache 缓存（§2.3）；支持 `Range`，视频可拖动进度条 |
+| 现在（默认） | `/m` | Worker 从媒体桶读取并返回，`Cache-Control: public, max-age=31536000, immutable`；支持 `Range`（超出末尾的区间截断，越界返回 416），视频可拖动进度条；只放行 `photo/ video/ gif/ thumb/ link/` |
 | 备选 | `https://pub-xxx.r2.dev` | R2 公开地址，不占 Worker 请求；但官方限速、不建议生产使用、无 CDN 缓存 |
 | 域名迁入后（最终） | `https://media.<域名>` | R2 绑定自定义域名直出，走 Cloudflare CDN 缓存，不占 Worker 请求 |
 
 **域名计划**：现有域名不在 Cloudflare，分两步走：
 
-1. **现在**：直接用 `thought-worker.<账号>.workers.dev`，页面、API、媒体、Webhook 全在这个地址上。
+1. **现在**：直接用 `thought-worker.<账号>.workers.dev`，页面、媒体、Webhook 全在这个地址上。
 2. **把域名迁到 Cloudflare 后**（在注册商处把 NS 改成 Cloudflare 给的两个）：
-   - 给 Worker 绑定自定义域名（如 `note.example.com`），用新域名重新 `setWebhook`；
-   - 给 R2 绑定 `media.example.com`，把 `MEDIA_BASE` 改成它，媒体不再占 Worker 请求数；
+   - 给 Worker 绑定自定义域名（如 `note.example.com`），用新域名重新 `setWebhook`，`site.env` 里的 `SITE_URL` 改成新域名；
+   - 给**媒体桶**绑定 `media.example.com`，把 `MEDIA_BASE` 改成它，媒体不再占 Worker 请求数（数据桶永远不绑定、不公开）；
    - 旧的 `workers.dev` 地址 301 跳到新域名。
 
 > Workers 自定义域名要求域名的 DNS 托管在 Cloudflare；只加一条 CNAME 指过去的方式需要付费套餐，所以迁移 NS 是必要的。
@@ -294,79 +291,66 @@ channel_post: text 以 bot_command "/del" 开头 且 带 reply_to_message
 
 ### 4.8 链接预览卡片
 
-Telegram 只告诉 Bot 预览的开关和偏好（`link_preview_options`），**不给卡片内容**，所以需要 Worker 自己抓取。
+Telegram 只告诉 Bot 预览的开关和偏好（`link_preview_options`），**不给卡片内容**，所以构建时自己抓取。
 
 - **触发条件**：纯文字帖（带图片视频的帖子不出卡片，和 Telegram 一致）、含链接、且 `link_preview_options.is_disabled` 不为 true。
 - **取哪个链接**：`link_preview_options.url` 优先，否则取第一个 `url` / `text_link` entity。
-- **抓取**：作为后台任务（Workers 上是 `ctx.waitUntil`）异步做，不阻塞 webhook 返回；超时 5 秒，只读 HTML 前 512KB，按 `Content-Type` / `<meta charset>` 解码，用正则解析 `og:*` / `twitter:*` / `<title>` / `description`（不用 Workers 专有的 `HTMLRewriter`，保持可移植）。
+- **抓取**：整批消息处理完之后，对有变化的纯文字帖每个抓一次（按最后一次编辑的内容，避免同一批里的旧链接覆盖新链接），各帖子之间并行；超时 5 秒，只读 HTML 前 512KB，按 `Content-Type` / `<meta charset>` 解码，用正则解析 `og:*` / `twitter:*` / `<title>` / `description`。
+- **只访问公网**：网页地址和 `og:image` 地址（来自第三方网页）都要检查，拒绝 localhost、内网 / 链路本地 / 云元数据 IP、单标签主机名；重定向改为手动跟随，每一跳重新检查。自建服务器上构建时尤其重要。
 - **配图**：`og:image` 转存到 R2（上限 5MB），避免外链图片失效或防盗链。
 - **样式**：宽图（宽高比 ≥ 1.5）用大图卡片，否则小缩略图卡片；尊重 `prefer_small_media` / `prefer_large_media` / `show_above_text`。
 - **失败**：不显示卡片，链接照常是可点的文字；编辑消息导致链接变化时重新抓取。
 
 ### 4.9 时区：固定 Asia/Shanghai
 
-数据库只存 UTC 时间戳；「哪一天」「今天 / 昨天」「HH:mm」、热力图、日期筛选统一按 `SITE_TZ = "Asia/Shanghai"`（`wrangler.toml` 的 vars）计算，所有访客看到的日期一致。
+数据库只存 UTC 时间戳；「哪一天」「今天 / 昨天」「HH:mm」、热力图、日期筛选统一按 `SITE_TZ = "Asia/Shanghai"`（`site.env`）计算，所有访客看到的日期一致。
 
-- **格式化**：服务端用 `Intl.DateTimeFormat("zh-CN", { timeZone: SITE_TZ })` 渲染；前端 JS（无限滚动追加的内容）用同样的参数，不用浏览器本地时区。
-- **按天换算**：上海没有夏令时，固定 UTC+8，`YYYY-MM-DD` 转 UTC 区间就是 `[当天 00:00 − 8h, 次日 00:00 − 8h)`；热力图直接在 SQL 里 `date(created_at + 8*3600, 'unixepoch')` 分组。
-- **「今天 / 昨天」**：跟着缓存走会过期（缓存里的「今天」过了零点就不对），所以这类相对日期交给前端 JS 按 `SITE_TZ` 计算后替换，HTML 里只输出绝对日期。
+- **格式化**：构建时用 `Intl.DateTimeFormat` 加 `timeZone: SITE_TZ` 渲染时间，索引里每条帖子带上按站点时区算好的日期（`d`），前端筛选直接比较字符串。
+- **「今天 / 昨天」、热力图**：静态页面构建后可能几天都不更新，这类跟「现在」有关的内容由前端按 `SITE_TZ` 实时计算，HTML 里只输出绝对日期。
 
 ---
 
 ## 5. 数据模型
 
-完整建表语句见 [`migrations/0001_init.sql`](../migrations/0001_init.sql)（SQLite 方言，D1 和 `node:sqlite` 通用）。
+数据库是一个 SQLite 文件，存放在私有数据桶的 `state/thought.db`，构建时取回、构建完回写。完整建表语句见 [`migrations/0001_init.sql`](../migrations/0001_init.sql)。
 
 | 表 | 作用 | 要点 |
 | --- | --- | --- |
 | `posts` | 帖子 | `(chat_id, group_key)` 唯一；`tg_message_id` 取帖子最早一条消息，用于 t.me 回链；`text_message_id` 记录文字来自相册的哪一条；`forward` 存转发来源 JSON；软删 `deleted` |
 | `messages` | TG 消息 → 帖子 | 编辑、`/del` 都按 `(chat_id, message_id)` 找回帖子 |
-| `media` | 图片 / 视频 / GIF | `blob_key` 存对象存储 key（不存 URL，输出时按 `MEDIA_BASE` 拼）；`thumb_key` 图片为中等尺寸、视频为封面；`status` = ready / too_large / failed |
+| `media` | 图片 / 视频 / GIF | `blob_key` 存对象存储 key（不存 URL，输出时按 `MEDIA_BASE` 拼）；`thumb_key` 图片为中等尺寸、视频为封面；`status` = ready / too_large / failed；保存 `file_id` 和 `attempts` 用于重试 |
 | `post_tags` | 标签 | 来自 `hashtag` 实体 |
 | `link_previews` | 链接卡片 | 一条帖子最多一张；`layout` = large / small |
-| `posts_fts` | 全文检索 | FTS5 trigram，触发器同步；少于 3 个字的关键词回退 `LIKE` |
+| `posts_fts` | 全文检索 | FTS5 trigram，触发器同步（目前搜索在前端做，保留备用） |
 
-- 对象 key：`photo|video|gif/<file_unique_id>.<ext>`、`thumb/<file_unique_id>.jpg`、`link/<url 的 sha256 前 32 位>.<ext>`。
+- 数据桶：`inbox/<update_id>.json`（收件箱）、`state/thought.db`（数据库）、`state/build.lock`（构建锁）。
+- 媒体桶：`photo|video|gif/<file_unique_id>.<ext>`、`thumb/<file_unique_id>.jpg`、`link/<url 的 sha256 前 32 位>.<ext>`。
+- 只接受浏览器能直接显示、不会执行脚本的格式：图片 jpeg / png / webp / gif，视频 mp4 / webm / mov；SVG、HEIC、TIFF 等文件不当作媒体。
 - 存 `width/height` 是为了前端提前占位，避免图片加载时页面跳动。
 
 ---
 
-## 6. 接口
+## 6. 接口与输出
+
+动态接口只有两个（接收端）：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/tg/webhook` | Telegram 回调 |
-| GET | `/api/posts?cursor=&tag=&q=&from=&to=&limit=20` | 时间线，游标 = `created_at:id`；`from`/`to` 为 `YYYY-MM-DD`（含两端，按上海时区） |
-| GET | `/api/posts/:id` | 单条 |
-| GET | `/api/tags` | 标签及计数 |
-| GET | `/api/stats` | 条数 / 天数 / 媒体数 |
-| GET | `/api/stats/heatmap?from=&to=` | 每日条数（上海时区；热力图 + 日历小圆点共用） |
-| GET | `/m/:key` | 媒体（R2 代理 + 边缘缓存 + Range） |
-| GET | `/?tag=&q=&from=&to=`、`/p/:id` | 服务端渲染页面（走缓存）；`/tag/:tag` 301 到 `/?tag=` |
-| GET | `/fragments/timeline?…&cursor=` | 前端筛选 / 无限滚动用的 HTML 片段（JSON 包装），帖子模板只维护服务端一份 |
-| GET | `/rss.xml` | RSS |
+| POST | `/tg/webhook` | Telegram 回调，存进收件箱 |
+| GET | `/m/<photo|video|gif|thumb|link>/<key>` | 媒体（`MEDIA_BASE=/m` 时），支持 `Range` / `416` / `ETag` |
 
-`/api/posts` 返回示例：
+其余都是构建生成的静态文件：
 
-```json
-{
-  "items": [{
-    "id": 128,
-    "html": "今天把博客迁到 Cloudflare 了 <a href=\"/tag/折腾\">#折腾</a>",
-    "created_at": 1759132800,
-    "edited": false,
-    "tags": ["折腾"],
-    "media": [
-      { "kind": "photo", "url": "/m/AQAD...jpg", "thumb": "/m/AQAD...m.jpg", "w": 1280, "h": 960 },
-      { "kind": "video", "url": "/m/BAAD...mp4", "poster": "/m/AAMC...jpg", "w": 720, "h": 1280, "duration": 12 }
-    ],
-    "forward": { "type": "channel", "name": "某个频道", "url": "https://t.me/somechannel/88" },
-    "link_preview": null,
-    "tg_link": "https://t.me/xxx/345"
-  }],
-  "next_cursor": "1759132800:128"
-}
-```
+| 路径 | 内容 |
+| --- | --- |
+| `/index.html` | 首页：侧栏 + 首屏 `PAGE_SIZE` 条帖子（不开 JS 也能看） |
+| `/p/<id>/` | 单条详情页，带 OG 信息，便于分享 |
+| `/data/index.json` | 所有帖子的索引：`{ id, t（时间戳）, d（日期）, g（标签）, s（纯文本） }`，前端筛选 / 搜索 / 热力图 / 日历用 |
+| `/data/month/YYYY-MM.json` | 该月每条帖子渲染好的 HTML（`{ id: html }`），无限滚动按需加载 |
+| `/rss.xml`、`/404.html`、`/assets/*` | RSS、404 页、样式脚本 |
+
+- 筛选条件在 URL 上（`/?tag=&q=&from=&to=`），前端读取后过滤索引，分享链接打开就是同样的结果。
+- 帖子 HTML 只在服务端模板里维护一份，前端只负责按天分组插入。
 
 ---
 
@@ -382,7 +366,7 @@ UI Demo：`demo/index.html`（纯静态，直接浏览器打开）。
 - **日期筛选**：工具栏日历按钮弹出月历，有内容的日子标小圆点；点一下选单日，再点一下成区间；桌面端也可直接点热力图格子。筛选条件以 chip 形式显示，可单独清除，并同步到 URL（`?from=&to=`）便于分享。
 - **转发**：内容上方一行浅色「↪ 转发自 xxx」，有链接时可点击。
 - **链接卡片**：大图卡片（封面 1.91:1 + 站点 / 标题 / 描述）和小图卡片（右侧 88px 缩略图）两种，整张可点。
-- **交互**：标签筛选、搜索、无限滚动、复制单条链接。
+- **交互**：标签筛选、搜索、无限滚动、复制单条链接。筛选 / 搜索都在浏览器里完成；每次追加后会检查底部是否仍在预加载范围内并继续加载；切换筛选时丢弃旧请求的结果。
 
 ### 7.1 响应式与移动端
 
@@ -409,20 +393,25 @@ UI Demo：`demo/index.html`（纯静态，直接浏览器打开）。
 thought-worker/
 ├─ docs/DESIGN.md
 ├─ demo/index.html                 # UI 原型
-├─ migrations/0001_init.sql        # D1 / node:sqlite 通用
-├─ public/assets/                  # app.css / app.js / favicon（无构建步骤）
+├─ migrations/0001_init.sql
+├─ public/                         # 原样复制进站点：assets/（app.css · app.js · favicon）、_headers
 ├─ scripts/set-webhook.ts          # 设置 / 查看 / 删除 webhook
+├─ site.env                        # 站点配置（非密钥，提交到仓库）
 ├─ src/
 │  ├─ core/                        # 与平台无关
 │  │  ├─ ports.ts  config.ts
-│  │  ├─ lib/                      # time（时区）· html · range · image-size
+│  │  ├─ lib/                      # time（时区）· html · range · image-size · url-guard（内网地址检查）
 │  │  ├─ telegram/                 # types · client · normalize · entities · forward
-│  │  ├─ services/                 # ingest（入库 / /del）· media · link-preview · link-meta · timeline（查询）
-│  │  └─ http/                     # app · cache · routes/{webhook,api,media,pages} · views/*.tsx（Hono JSX）
+│  │  ├─ services/                 # inbox · ingest（入库 / /del）· media（含重试）· link-preview · link-meta · timeline
+│  │  ├─ build/site.tsx            # 数据库 → 静态文件
+│  │  └─ http/                     # 接收端 app · routes/{webhook,media} · views/*.tsx（Hono JSX 模板）
+│  ├─ build/                       # 构建入口（Node）：main · pipeline · storage
 │  └─ adapters/
-│     ├─ cloudflare/               # index（Worker 入口）· d1 · r2
-│     └─ node/                     # main（入口）· index · sqlite（含迁移）· fs-store · memory-cache
+│     ├─ cloudflare/               # Worker 入口 · r2
+│     ├─ node/                     # 自建服务器入口 · sqlite（含迁移）· fs-store
+│     └─ s3/                       # S3 兼容存储
 ├─ test/                           # vitest：单元 + 端到端（假 Telegram API）
+├─ .github/workflows/build.yml     # 每日构建
 ├─ wrangler.toml  Dockerfile  .env.example  .dev.vars.example
 ```
 
@@ -432,13 +421,14 @@ thought-worker/
 
 | 里程碑 | 状态 |
 | --- | --- |
-| M1 管道打通：Worker + D1 + R2 + Webhook | ✅ 已实现，`wrangler dev` 本地验证 |
-| M2 消息完善：相册、视频 / GIF、封面、20MB 降级、编辑、`/del`、转发 | ✅ 已实现，端到端测试覆盖 |
-| M3 前端：服务端渲染、灯箱、无限滚动、深色模式、缓存与清除 | ✅ 已实现，浏览器自动化验证 |
+| M1 接收端：webhook → 收件箱 | ✅ 已实现，`wrangler dev` 验证 |
+| M2 构建：入库、相册、视频 / GIF、20MB 降级、编辑、`/del`、转发、媒体重试 | ✅ 已实现，端到端测试覆盖 |
+| M3 静态站点：首页、详情页、索引 / 分块、灯箱、无限滚动、深色模式 | ✅ 已实现，浏览器自动化验证 |
 | M4 增强：标签、搜索、热力图、日期筛选、链接卡片、RSS、OG | ✅ 已实现 |
-| M5 域名：迁入 Cloudflare、自定义域名、R2 媒体域名 | ⏳ 待域名迁移 |
+| M5 每日构建：GitHub Actions | ✅ 已编写，待配置 Secrets 后在线上验证 |
+| M6 域名：迁入 Cloudflare、自定义域名、R2 媒体域名 | ⏳ 待域名迁移 |
 
-Docker 镜像已在本机（OrbStack）构建并跑通入库、媒体、重启持久化。尚未在真实环境验证：真实 Bot 推送、线上 Cloudflare 部署、Workers Cache 的标签清除（本地 `wrangler dev` 不模拟）。
+已验证：Node + 本地磁盘、Node + S3 兼容服务、`wrangler dev`、Docker 镜像。尚未在真实环境验证：真实 Bot 推送、线上 Cloudflare 部署、GitHub Actions 定时任务。
 
 ---
 
@@ -455,4 +445,8 @@ Docker 镜像已在本机（OrbStack）构建并跑通入库、媒体、重启�
 | 链接预览 | 要 | 见 §4.8 |
 | 时区 | 固定 Asia/Shanghai | 所有访客日期一致，页面可整页缓存，见 §4.9 |
 | 媒体地址 | 存 R2 key，按 `MEDIA_BASE` 拼 URL；现在 `/m`，域名迁入后切到 R2 自定义域名 | 见 §4.5 |
-| 渲染方式 | 动态渲染 + Workers Cache，不做静态生成 | 发帖即时生效，见 §2.3 |
+| 渲染方式 | ~~动态渲染 + Workers Cache~~ → **静态站点，每天构建一次** | 去掉服务端渲染、查询接口和缓存失效问题，见 §2 |
+| 接收方式 | webhook 只存原始消息，构建时处理 | 不受 getUpdates 24 小时保留期限制，见 §2.3 |
+| 数据存储 | SQLite 文件和媒体都放 R2，分两个桶 | 公开仓库只有代码；`/del` 删掉的内容不会留在 git 历史里；媒体桶可公开，数据桶永远私有 |
+| `/del` 时机 | 接收端立即删频道消息，构建时隐藏帖子 | 赶在 bot 的 48 小时删除期限内 |
+| Worker 语言 | 继续用 TypeScript | 和构建端共用收件箱格式、配置、媒体路由；wrangler 原生编译 TS |
