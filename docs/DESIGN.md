@@ -48,25 +48,25 @@
 
 ```
  Telegram 频道 ──webhook──▶ 接收端（Worker，几十行）
-                              │ 校验密钥，原样存进 R2：inbox/<update_id>.json
+                              │ 校验密钥，原样写进 D1 的 inbox 表
                               ▼
-       ┌──────── R2: thought-worker-data（私有）───────┐  ┌── R2: thought-worker-media（可公开）──┐
-       │ inbox/  收件箱   state/thought.db  数据库     │  │ photo/ video/ gif/ thumb/ link/        │
-       │ state/build.lock  构建锁                      │  │                                        │
+       ┌──────────── D1: thought-worker ─────────────┐  ┌── R2: thought-worker-media（不公开）──┐
+       │ inbox 收件箱   build_lock 构建锁              │  │ photo/ video/ gif/ thumb/ link/        │
+       │ posts / media / post_tags / link_previews     │  │                                        │
        └───────────────────────▲──────────────────────┘  └───────────────────▲────────────────────┘
-                                             │ S3 API
- 每天 04:00（GitHub Actions） ──▶ 构建端 ─────┴─────────────────────────────────────────┘
-   加锁 → 取回数据库 → 重试之前失败的媒体 → 处理收件箱（入库 / 转存媒体 / /del）→ 链接预览
-   → 没有变化就结束 → 渲染整站静态文件 → wrangler deploy → 核对后回写数据库、清空收件箱 → 解锁
+                               │ D1 HTTP API                                  │ S3 API
+ 每天 04:00（GitHub Actions） ──▶ 构建端 ─────┴──────────────────────────────────────────────┘
+   加锁 → 重试之前失败的媒体 → 处理收件箱（入库 / 转存并压缩媒体 / /del）→ 链接预览
+   → 没有变化就结束 → 渲染整站静态文件 → wrangler deploy → 核对锁后删掉已处理的收件箱 → 解锁
 
- 访客 ──▶ 静态文件（Workers Static Assets，不执行代码）；/m/* 媒体经 Worker 读 R2
+ 访客 ──▶ 静态文件（Workers Static Assets，不执行代码）；/m/* 媒体经 Worker（边缘缓存 → R2）
 ```
 
 **接收和构建分开**：
 
-- **接收端**只做校验和存储，不解析内容、不连数据库，攻击面只有一个接口；Telegram 的推送立刻落盘，不受「未取走的更新只保留 24 小时」的限制。唯一的例外是 `/del`：立即调用 `deleteMessages` 删掉指令和被回复的消息（见 §4.4）。
-- **两个桶**：媒体桶可以整体公开（绑定自定义域名直出）；收件箱、数据库、构建锁放在私有的数据桶，任何情况下都不能被外部读到。
-- **构建端**每天跑一次，把积压的消息一次处理完；没有新消息就什么都不做。部署成功后才回写数据库和清空收件箱，任何一步失败，下次构建会重新处理（入库是幂等的）。
+- **接收端**只做校验和写收件箱，不解析内容，攻击面只有一个接口；Telegram 的推送立刻落盘，不受「未取走的更新只保留 24 小时」的限制。唯一的例外是 `/del`：立即调用 `deleteMessages` 删掉指令和被回复的消息（见 §4.4）。
+- **数据和媒体分开**：帖子、收件箱、构建锁都在 D1（结构化、原子操作，Workers 免费版自带，不用绑卡）；R2 只放图片视频，而且不开公开访问，只经 Worker 读取（见 §2.2）。
+- **构建端**每天跑一次，把积压的消息一次处理完；没有新消息就什么都不做。入库直接写 D1，收件箱要等部署成功才删；任何一步失败，下次构建会重新处理同一批消息（入库是幂等的）。
 - **网站是纯静态文件**：没有服务端渲染、没有查询接口、没有缓存失效问题；筛选、搜索、分页在浏览器里基于构建生成的索引完成。
 
 ### 2.1 选型
@@ -74,8 +74,8 @@
 | 层 | 选型 | 理由 |
 | --- | --- | --- |
 | 接收端 + 托管 | Cloudflare Workers + Static Assets | 静态文件请求免费且不计次数；只有 webhook 和媒体会执行 Worker |
-| 数据 | SQLite 文件（存在私有的数据桶） | 构建时下载、构建完上传；不需要 D1，自建时就是本地文件 |
-| 媒体 / 收件箱 | 两个 R2 桶 | 免费 10GB、出站流量免费；构建端通过 S3 API 访问 |
+| 数据 | D1（SQLite 方言） | 免费 5GB，超额只报错不扣费；接收端用 binding，构建端用 HTTP API；自建时就是本地 SQLite 文件 |
+| 媒体 | 一个 R2 桶 | 免费 10GB、出站流量免费；构建端通过 S3 API 访问 |
 | 构建 | GitHub Actions 定时任务 | 公开仓库免费；完整 Node 环境；可手动触发 |
 | 渲染 | Hono JSX（构建时渲染成 HTML） | 同一套模板，不开 JS 也能看首屏和详情页 |
 | 前端交互 | 原生 JS（`public/assets/app.js`） | 无构建步骤 |
@@ -87,12 +87,21 @@
 | Workers 请求 | 10 万 / 天 | 页面、数据、css/js 都是静态文件，**不计**；只有媒体（`/m`）和 webhook 计入 ≈ 1.5 万 |
 | R2 存储 | 10GB | 主要瓶颈，看视频多少（见 §4.6） |
 | R2 操作 | A 类 100 万 / B 类 1000 万 每月 | 每天一次构建 + 媒体读取，远低于 |
+| D1 | 5GB；每天读 500 万行、写 10 万行 | 每天一次构建全量渲染，几万行读取；超额只报错不扣费 |
 | GitHub Actions | 公开仓库不限分钟 | 每天一次，几十秒 |
 | Workers Static Assets | 单个版本 20000 个文件、单文件 25MB | 每条帖子一个详情页，约 2 万条后需要调整（例如详情页分目录合并） |
 
-⚠️ R2 需要在 Cloudflare 账户绑定支付方式才能开通（免费额度内不扣费）。
+⚠️ R2 需要在 Cloudflare 账户绑定支付方式才能开通，而且 **Cloudflare 没有硬性消费上限**（只有预算提醒邮件）。所以 R2 的每一项计费都要被别的东西封顶：
 
-- 媒体经 Worker 转发时，一次访问约 15 个请求，每天约可承载 6000 次访问；域名迁入后媒体改由 R2 自定义域名直出，就不再占 Worker 请求。
+| R2 计费项 | 怎么封顶 |
+| --- | --- |
+| B 类读取 | 桶不开公开访问（不开 `r2.dev`、不绑自定义域名），只经 Worker 的 `/m` 读取；Workers 免费版每天最多 10 万次请求 → 每月最多约 300 万次读取，低于免费额度。**Workers 要一直留在免费版** |
+| A 类写入 | 只有构建端写（每天一次）；webhook 写的是 D1 |
+| 存储 | 只有自己发的图；图片转存时压缩（见 §2.2.1） |
+
+剩下的风险是构建端的 R2 API 密钥泄露：密钥只授权媒体桶、只放在 GitHub Secrets 里。建议再设一个 $1 的预算提醒兜底。
+
+- 媒体经 Worker 转发时，一次访问约 15 个请求，每天约可承载 6000 次访问（边缘缓存省的是 R2 读取和延迟，Worker 请求数照算）。
 - 超出免费额度不会扣费：当天剩余的 Worker 请求返回错误 1027，次日恢复；静态页面不受影响。
 
 ### 2.2.1 访问速度
@@ -100,7 +109,7 @@
 - **静态文件**：直接由 Cloudflare 边缘节点返回，不执行代码、不查数据库。
 - **按需加载**：首屏帖子直接写在 HTML 里；筛选 / 翻页用的索引（`data/index.json`）和按月分块的帖子 HTML 按需加载。
 - **图片按尺寸取**：Telegram 会给每张图生成多个尺寸，转存时同时存中等尺寸（约 720px 以上的一档）做缩略图，时间线用缩略图，灯箱再加载原图。
-- **转存时压缩**：构建端用 sharp 把图片（照片、缩略图、链接卡片配图）转成 WebP（质量 80，最长边 2560，单张不超过 2MB：超过就先降质量到 50，再按 0.8 倍缩尺寸，最小 640），按 EXIF 方向转正并去掉 EXIF（包括「以文件发送」原图里的 GPS）；GIF 不处理，压缩失败或没变小就保留原图。接收端不做：webhook 只存原始消息，Workers 免费版每次只有 10ms CPU。
+- **转存时压缩**：构建端用 sharp 把图片（照片、缩略图、链接卡片配图）转成 WebP（质量 80，最长边 2560，单张不超过 2MB：超过就先降质量到 50，再按 0.8 倍缩尺寸，最小 640；动图 WebP / APNG 不处理，避免只剩第一帧），按 EXIF 方向转正并去掉 EXIF（包括「以文件发送」原图里的 GPS）；GIF 不处理，压缩失败或没变小就保留原图。接收端不做：webhook 只存原始消息，Workers 免费版每次只有 10ms CPU。
 - **边缘缓存**：`/m/*` 用 Workers Cache API 把完整文件缓存在当前节点，命中后不再读 R2，也省掉一次跨地区回源；`Range` 和 `If-None-Match` 由缓存直接应答（206 / 304）。缓存键只取路径，带随机查询参数也绕不过去。⚠️ Cache API 在 `*.workers.dev` 上不生效，要绑自定义域名；缓存省的是 R2 读取和延迟，Worker 请求数照算。
 - ⚠️ **中国大陆**：`*.workers.dev`（以及 `*.r2.dev`）在大陆基本无法直接访问；绑定自定义域名后可以访问，但 Cloudflare 免费版在大陆没有节点，延迟约 150~300ms+。真正的大陆加速需要 ICP 备案 + 国内 CDN，不在免费范围内。**所以域名迁入 Cloudflare 的优先级要提前。**
 
@@ -115,33 +124,37 @@
 - 一个月最多约 30 次定时构建；部署用 `wrangler deploy` 直接上传，不占 Pages 的构建额度。
 - **同一时间只跑一个构建**，三道保护：
   1. GitHub Actions 的 `concurrency` 分组；
-  2. 构建锁 `state/build.lock`：用「不存在才创建」（R2 / S3 的 `If-None-Match: *`，本地磁盘的 `O_EXCL`）拿锁，锁里放随机令牌，拿到后读回核对；超过 1 小时的锁视为异常退出留下的，可以接管；
-  3. 回写前核对锁令牌仍是自己的、数据库的 ETag 与下载时一致，否则放弃回写（下次构建重新处理）。
-  即使存储不支持条件写入（部分 S3 兼容服务），第 3 道也能保证不会用旧库覆盖新库。
+  2. 构建锁：`build_lock` 表只有一行，一条 `INSERT … ON CONFLICT DO UPDATE … WHERE 已过期 RETURNING` 完成「没有就拿、过期就接管」，锁里放随机令牌；超过 1 小时的锁视为异常退出留下的；
+  3. 部署前后各核对一次锁令牌；清理收件箱的语句本身也以「锁仍是自己的」为条件，检查和删除在同一条语句里，不会删掉接管者正在处理的记录。
 - 为什么不是「每天拉一次 getUpdates」：Telegram 未取走的更新最多保留 24 小时，每天拉一次正好卡在边界上，定时任务一延迟就会丢消息；webhook + 收件箱没有这个问题。
 
 ### 2.4 可移植性：核心与平台解耦
 
 ```
 src/core/            只用标准 Web API（fetch / Streams / Web Crypto / Intl）+ Hono
-  ports.ts           平台接口：Database（SQLite 方言）/ BlobStore / BackgroundTasks
+  ports.ts           平台接口：Database（SQLite 方言）/ BlobStore / MediaCache / ImageOptimizer
   build/site.tsx     数据库 → 静态文件
-src/build/           构建流程（Node）：存储选择、取回 / 回写数据库、部署
+src/build/           构建流程（Node）：数据库 / 存储选择、图片压缩（sharp）、部署
 src/adapters/
-  cloudflare/        接收端 Worker（R2 binding）
+  cloudflare/        接收端 Worker（D1 + R2 binding、Cache API）
+  d1/                构建端通过 HTTP API 访问 D1
   node/              自建服务器（接收端 + 静态文件）· node:sqlite · 本地磁盘
-  s3/                S3 兼容存储（R2 / MinIO / AWS S3）
+  s3/                S3 兼容存储（R2 / MinIO / AWS S3 / B2），只放媒体
 ```
 
 | | Cloudflare | 自建服务器 |
 | --- | --- | --- |
-| 接收端 | Worker，两个 R2 binding（`MEDIA` / `DATA`） | Node 服务，本地磁盘 `media/` + `private/`（或 S3 两个桶） |
-| 构建 | GitHub Actions，`STORAGE=r2`，`DEPLOY_COMMAND=npx wrangler deploy` | 系统 cron，`STORAGE=fs`，直接写到服务目录 |
+| 接收端 | Worker，binding：`DB`（D1）、`MEDIA`（R2） | Node 服务，`DATA_DIR/thought.db` + `DATA_DIR/media/`（媒体也可以放 S3） |
+| 构建 | GitHub Actions，`DB=d1`、`STORAGE=r2`，`DEPLOY_COMMAND=npx wrangler deploy` | 系统 cron，`DB=sqlite`、`STORAGE=fs`，直接写到服务目录 |
 | 托管 | Workers Static Assets | 同一个 Node 服务（或 nginx） |
 
 - 平台特有能力都有通用替代：链接预览用 `fetch` + 正则解析 meta（不用 `HTMLRewriter`）；图片尺寸从文件头读取。
 - 已验证：Node + 本地磁盘、Node + S3 兼容服务（Zenko CloudServer，校验签名）、`wrangler dev`（Workers 运行时）、Docker 镜像。
-- 数据可以直接搬：数据库就是一个 SQLite 文件，对象按 key 平铺，媒体拷到 `data/media/`、收件箱和数据库拷到 `data/private/` 即可。
+- 数据可以搬，但要绕开全文检索表：[D1 导出不支持带虚拟表的数据库](https://developers.cloudflare.com/d1/best-practices/import-export-data/)，而 `posts_fts` 是 FTS5 虚拟表。步骤：
+  1. `wrangler d1 execute thought-worker --remote --command "DROP TRIGGER posts_fts_insert; DROP TRIGGER posts_fts_delete; DROP TRIGGER posts_fts_update; DROP TABLE posts_fts;"`
+  2. `wrangler d1 export thought-worker --remote --output thought.sql`，然后 `sqlite3 data/thought.db < thought.sql`
+  3. 在两边重新执行 `0001_init.sql` 末尾建 `posts_fts` 和触发器的语句，再 `INSERT INTO posts_fts (posts_fts) VALUES ('rebuild')` 重建索引
+  迁移记录表和 wrangler 的 `d1_migrations` 结构一致，导出后可以接着迁移；媒体按 key 平铺，拷到 `data/media/` 即可。
 
 ---
 
@@ -192,25 +205,25 @@ src/adapters/
 POST /tg/webhook（接收端）
  ├─ 校验 header X-Telegram-Bot-Api-Secret-Token == WEBHOOK_SECRET  否则 401
  ├─ 校验是合法 JSON、带 update_id、不超过 1MB                     否则 400 / 413
- └─ 原样写入 inbox/<补零的 update_id>.json，返回 200
-    （update_id 单调递增，按 key 排序就是投递顺序；重复投递写同一个 key）
+ └─ 原样写入 inbox 表（主键 update_id），返回 200
+    （update_id 单调递增，按它排序就是投递顺序；重复投递命中主键被忽略）
 
 构建端（每天一次）
- ├─ 加锁（state/build.lock）
- ├─ 下载 state/thought.db（没有就新建）并记下 ETag，执行迁移
+ ├─ （迁移已由 wrangler d1 migrations apply 执行；自建时打开数据库时执行）
+ ├─ 加锁（build_lock）
  ├─ 重试之前 status = failed 的媒体（最多 5 次；先于新消息，刚失败的不会在同一次构建里重复下载）
- ├─ 按顺序处理 inbox/*：校验 chat.id == CHANNEL_ID → 归一化 → 入库（幂等）
- │    ├─ 媒体：getFile → 下载 → 写入媒体桶（key 用 file_unique_id，天然去重）
+ ├─ 按 update_id 顺序处理收件箱：校验 chat.id == CHANNEL_ID → 归一化 → 入库（幂等）
+ │    ├─ 媒体：getFile → 下载 → 压缩图片 → 写入媒体桶（key 用 file_unique_id，天然去重）
  │    └─ /del：软删帖子，删除频道里的指令和整个相册
  ├─ 链接预览：这一批里有变化的纯文字帖，每个帖子按最后一次编辑抓一次（并行）
- ├─ 收件箱为空且没有重试成功 → 不渲染；若尝试过重试，仍回写数据库（记录重试次数）
+ ├─ 收件箱为空且没有重试成功 → 不渲染，结束
  ├─ 渲染到临时目录，整体替换输出目录
  ├─ 部署（DEPLOY_COMMAND）
- ├─ 核对锁令牌和数据库 ETag
- └─ 上传数据库、删除已处理的收件箱文件、解锁
+ ├─ 核对锁令牌仍是自己的
+ └─ 删除这次处理过的收件箱记录（构建期间新到的留给下一次）、解锁
 ```
 
-- **失败即重来**：部署成功前不回写任何东西；中途失败，下次构建把同一批消息重新处理一遍。
+- **失败即重来**：入库直接写 D1，但收件箱要等部署成功才删；中途失败，下次构建把同一批消息重新处理一遍，入库是幂等的，结果一样。
 - **单个媒体下载失败**只标记 `failed`，不影响整批构建；之后每次构建自动重试（用保存的 `file_id`，它对 bot 长期有效）。
 - 同一个文件（`file_unique_id`）在别的帖子里转存过就直接复用。
 
@@ -259,16 +272,16 @@ channel_post: text 以 bot_command "/del" 开头 且 带 reply_to_message
 | --- | --- | --- |
 | 现在（默认） | `/m` | Worker 先查边缘缓存，未命中再从媒体桶读取，`Cache-Control: public, max-age=31536000, immutable`；支持 `Range`（超出末尾的区间截断，越界返回 416），视频可拖动进度条；只放行 `photo/ video/ gif/ thumb/ link/`；防盗链见下 |
 | 备选 | `https://pub-xxx.r2.dev` | R2 公开地址，不占 Worker 请求；但官方限速、不建议生产使用、无 CDN 缓存 |
-| 域名迁入后（最终） | `https://media.<域名>` | R2 绑定自定义域名直出，走 Cloudflare CDN 缓存，不占 Worker 请求 |
+| ~~域名迁入后~~ | ~~`https://media.<域名>`~~ | **不采用**：R2 公开直出后读取次数不再被 Worker 免费额度封顶，R2 又没有消费上限。媒体始终走 `/m`，靠边缘缓存提速 |
 
-- **防盗链**（`/m/*`）：没有 `Referer` 的请求放行（直接打开、RSS 阅读器、抓分享卡片的爬虫）；有 `Referer` 时只放行本站、`SITE_URL` 和 `MEDIA_ALLOWED_REFERERS`，其余返回 403（`no-store`，不进缓存）。先校验再查缓存。对方用 `referrerpolicy="no-referrer"` 仍能绕过，所以只是减少盗链，R2 读取量的硬上限仍然是 Workers 免费版每天 10 万次请求。
+- **防盗链**（`/m/*`）：没有 `Referer` 的请求放行（直接打开、桌面 RSS 阅读器、抓分享卡片的爬虫）；页面跳转（`Sec-Fetch-Dest: document`，别的网站上指向图片的链接）放行；其余只放行本站、`SITE_URL` 和 `MEDIA_ALLOWED_REFERERS`（写 host 或完整地址都行），否则返回 403（`no-store`，不进缓存）。网页版 RSS 阅读器直接嵌图时带的是阅读器的域名，需要的话加进白名单。先校验再查缓存。对方用 `referrerpolicy="no-referrer"` 仍能绕过，所以只是减少盗链，R2 读取量的硬上限仍然是 Workers 免费版每天 10 万次请求。
 
 **域名计划**：现有域名不在 Cloudflare，分两步走：
 
 1. **现在**：直接用 `thought-worker.<账号>.workers.dev`，页面、媒体、Webhook 全在这个地址上。
 2. **把域名迁到 Cloudflare 后**（在注册商处把 NS 改成 Cloudflare 给的两个）：
    - 给 Worker 绑定自定义域名（如 `note.example.com`），用新域名重新 `setWebhook`，`site.env` 里的 `SITE_URL` 改成新域名；
-   - 给**媒体桶**绑定 `media.example.com`，把 `MEDIA_BASE` 改成它，媒体不再占 Worker 请求数（数据桶永远不绑定、不公开）；
+   - 媒体桶**不**绑定域名、不开公开访问（见上表）；绑定自定义域名后 `/m` 的边缘缓存才生效（Cache API 在 `workers.dev` 上不工作）；
    - 旧的 `workers.dev` 地址 301 跳到新域名。
 
 > Workers 自定义域名要求域名的 DNS 托管在 Cloudflare；只加一条 CNAME 指过去的方式需要付费套餐，所以迁移 NS 是必要的。
@@ -316,7 +329,7 @@ Telegram 只告诉 Bot 预览的开关和偏好（`link_preview_options`），**
 
 ## 5. 数据模型
 
-数据库是一个 SQLite 文件，存放在私有数据桶的 `state/thought.db`，构建时取回、构建完回写。完整建表语句见 [`migrations/0001_init.sql`](../migrations/0001_init.sql)。
+数据库是 D1（自建时是本地 SQLite 文件），接收端和构建端直接读写。建表语句见 [`migrations/`](../migrations/)，Cloudflare 上用 `wrangler d1 migrations apply` 执行。
 
 | 表 | 作用 | 要点 |
 | --- | --- | --- |
@@ -326,9 +339,11 @@ Telegram 只告诉 Bot 预览的开关和偏好（`link_preview_options`），**
 | `post_tags` | 标签 | 来自 `hashtag` 实体 |
 | `link_previews` | 链接卡片 | 一条帖子最多一张；`layout` = large / small |
 | `posts_fts` | 全文检索 | FTS5 trigram，触发器同步（目前搜索在前端做，保留备用） |
+| `inbox` | 收件箱 | 主键 `update_id`，存原始 JSON；部署成功后删除处理过的 |
+| `build_lock` | 构建锁 | 只有一行：令牌 + 获取时间 |
+| `site_state` | 站点状态 | 只有一行：`publish_pending` 标记数据库里还没发布的变化（重试修好了媒体但部署失败），部署成功后清零 |
 
-- 数据桶：`inbox/<update_id>.json`（收件箱）、`state/thought.db`（数据库）、`state/build.lock`（构建锁）。
-- 媒体桶：`photo|video|gif/<file_unique_id>.<ext>`、`thumb/<file_unique_id>.jpg`、`link/<url 的 sha256 前 32 位>.<ext>`。
+- 媒体桶：`photo|video|gif/<file_unique_id>.<ext>`、`thumb/<file_unique_id>.<ext>`、`link/<url 的 sha256 前 32 位>.<ext>`（图片压缩后扩展名是 `webp`）。
 - 只接受浏览器能直接显示、不会执行脚本的格式：图片 jpeg / png / webp / gif，视频 mp4 / webm / mov；SVG、HEIC、TIFF 等文件不当作媒体。
 - 存 `width/height` 是为了前端提前占位，避免图片加载时页面跳动。
 
@@ -448,9 +463,9 @@ thought-worker/
 | 转发消息 | 展示并标注来源 | 见 §4.7 |
 | 链接预览 | 要 | 见 §4.8 |
 | 时区 | 固定 Asia/Shanghai | 所有访客日期一致，页面可整页缓存，见 §4.9 |
-| 媒体地址 | 存 R2 key，按 `MEDIA_BASE` 拼 URL；现在 `/m`，域名迁入后切到 R2 自定义域名 | 见 §4.5 |
+| 媒体地址 | 存 R2 key，按 `MEDIA_BASE` 拼 URL；始终 `/m`（Worker + 边缘缓存），R2 不公开 | 见 §4.5 |
 | 渲染方式 | ~~动态渲染 + Workers Cache~~ → **静态站点，每天构建一次** | 去掉服务端渲染、查询接口和缓存失效问题，见 §2 |
 | 接收方式 | webhook 只存原始消息，构建时处理 | 不受 getUpdates 24 小时保留期限制，见 §2.3 |
-| 数据存储 | SQLite 文件和媒体都放 R2，分两个桶 | 公开仓库只有代码；`/del` 删掉的内容不会留在 git 历史里；媒体桶可公开，数据桶永远私有 |
+| 数据存储 | ~~SQLite 文件和媒体都放 R2，分两个桶~~ → **数据放 D1，R2 只放媒体** | 公开仓库只有代码；`/del` 删掉的内容不会留在 git 历史里；D1 免费版超额只报错不扣费 |
 | `/del` 时机 | 接收端立即删频道消息，构建时隐藏帖子 | 赶在 bot 的 48 小时删除期限内 |
 | Worker 语言 | 继续用 TypeScript | 和构建端共用收件箱格式、配置、媒体路由；wrangler 原生编译 TS |

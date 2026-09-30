@@ -13,14 +13,14 @@ function safeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-// 只做校验和存储，处理全部放到构建端；唯一的例外是 /del，要赶在 48 小时内删掉频道里的消息
+// 只做校验和写收件箱，处理全部放到构建端；唯一的例外是 /del，要赶在 48 小时内删掉频道里的消息
 export const webhookRoutes = new Hono<AppEnv>().post("/webhook", async (c) => {
-  const { stores, config } = c.var.deps;
+  const { db, config } = c.var.deps;
   if (!config.webhookSecret) return c.text("webhook not configured", 503);
   if (!safeEqual(c.req.header("x-telegram-bot-api-secret-token") ?? "", config.webhookSecret)) {
     return c.text("unauthorized", 401);
   }
-  const result = await storeUpdate(stores.data, await c.req.text());
+  const result = await storeUpdate(db, await c.req.text());
   if (!result.ok) return c.text(result.reason, result.status);
   await deleteCommandNow(c.var.deps, result.update);
   return c.json({ ok: true });

@@ -1,7 +1,6 @@
 // 端到端：webhook → 收件箱 → 构建 → 静态文件，跑在 Node 适配器（本地磁盘存储）上
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DB_KEY, LOCK_KEY } from "../src/build/pipeline";
-import { listInbox } from "../src/core/services/inbox";
+import { readInbox } from "../src/core/services/inbox";
 import { SECRET, createTestEnv, edit, message, nextMessageId, photo, pngBytes, post, withEntities } from "./helpers";
 
 let t: ReturnType<typeof createTestEnv>;
@@ -11,6 +10,8 @@ beforeEach(() => {
 afterEach(() => t.cleanup());
 
 const ids = () => t.index().posts.map((p) => p.id);
+const inboxIds = async () => (await readInbox(t.db)).map((i) => i.updateId);
+const lockRow = () => t.db.first<{ token: string; acquired_at: number }>("SELECT token, acquired_at FROM build_lock");
 const texts = () => t.index().posts.map((p) => p.s);
 
 describe("receiver", () => {
@@ -22,7 +23,7 @@ describe("receiver", () => {
       body: "not json",
     });
     expect(bad.status).toBe(400);
-    expect(await listInbox(t.stores.data)).toEqual([]);
+    expect(await inboxIds()).toEqual([]);
   });
 
   it("stores updates in order and dedupes redeliveries", async () => {
@@ -31,10 +32,9 @@ describe("receiver", () => {
     await t.send(u2);
     await t.send(u1);
     await t.send(u1); // Telegram 重试
-    const keys = await listInbox(t.stores.data);
-    expect(keys).toHaveLength(2);
-    expect(await t.stores.media.list("inbox/")).toEqual([]); // 收件箱不在可公开的媒体存储里
-    expect(keys[0]).toContain(String(u1.update_id));
+    // 按 update_id 排序，重复投递被忽略
+    expect(await inboxIds()).toEqual([u1.update_id, u2.update_id]);
+    expect(await t.media.list("")).toEqual([]); // 收件箱不在媒体存储里
   });
 });
 
@@ -65,8 +65,8 @@ describe("build", () => {
     expect(t.file("404.html")).toContain("不见了");
     expect(t.exists("assets/app.js")).toBe(true);
 
-    expect(await listInbox(t.stores.data)).toEqual([]);
-    expect(await t.stores.data.get(DB_KEY)).not.toBeNull();
+    expect(await inboxIds()).toEqual([]);
+    expect(await lockRow()).toBeNull(); // 构建结束释放锁
     // 已处理过的消息被重新投递，不会重复
     await t.send(post(m));
     await t.build();
@@ -208,14 +208,66 @@ describe("build", () => {
     expect(downloads("gone")).toBe(5);
   });
 
-  it("does not commit anything when deploy fails", async () => {
+  it("keeps the inbox when deploy fails and reprocesses it idempotently", async () => {
     await t.send(post(message({ text: "部署失败的那次" })));
     await expect(t.build({ deploy: async () => Promise.reject(new Error("boom")) })).rejects.toThrow("boom");
-    expect(await listInbox(t.stores.data)).toHaveLength(1);
-    expect(await t.stores.data.get(DB_KEY)).toBeNull();
-    // 下次构建重新处理
+    expect(await inboxIds()).toHaveLength(1);
+    expect(await lockRow()).toBeNull();
+    // 下次构建重新处理，不会出现两条
     expect((await t.build()).processed).toBe(1);
     expect(texts()).toEqual(["部署失败的那次"]);
+    expect(await inboxIds()).toEqual([]);
+  });
+
+  it("only clears the updates it processed", async () => {
+    await t.send(post(message({ text: "构建前" })));
+    const late = post(message({ text: "部署期间到达" }));
+    await t.build({ deploy: async () => void (await t.send(late)) });
+    expect(await inboxIds()).toEqual([late.update_id]);
+    await t.build();
+    expect(texts()).toEqual(["部署期间到达", "构建前"]);
+  });
+
+  it("republishes media fixed by a retry even when that deploy failed", async () => {
+    t.fake.failing.add("rp");
+    await t.send(post(message({ photo: photo("rp") })));
+    await t.build();
+    t.fake.failing.clear();
+    // 重试成功（数据库里已是 ready），但这次部署失败
+    await expect(t.build({ deploy: async () => Promise.reject(new Error("boom")) })).rejects.toThrow("boom");
+    // 收件箱是空的、也没有待重试的媒体，仍然要重新发布
+    const r = await t.build();
+    expect(r.changed).toBe(true);
+    expect(t.postHtml(ids()[0]!)).toContain("photo/rp-u.jpg");
+    expect((await t.build()).changed).toBe(false); // 发布成功后标记清零
+  });
+
+  it("does not download a failed file twice or reset its attempts when the inbox is reprocessed", async () => {
+    t.fake.failing.add("f2");
+    await t.send(post(message({ photo: photo("f2") })));
+    await expect(t.build({ deploy: async () => Promise.reject(new Error("boom")) })).rejects.toThrow("boom");
+    expect(downloads("f2")).toBe(1);
+    // 收件箱还在：这次构建重试一次，重新处理消息时不再下载
+    await t.build();
+    expect(downloads("f2")).toBe(2);
+    expect(await t.db.first("SELECT status, attempts FROM media")).toEqual({ status: "failed", attempts: 2 });
+  });
+
+  it("does not deploy when the lock was taken over before deploying", async () => {
+    await t.send(post(message({ photo: photo("lk") })));
+    let deployed = false;
+    await expect(
+      t.build({
+        // 处理收件箱期间锁被接管
+        optimizeImage: async () => {
+          await t.db.run("UPDATE build_lock SET token = 'other'");
+          return null;
+        },
+        deploy: async () => void (deployed = true),
+      }),
+    ).rejects.toThrow("另一个构建正在进行");
+    expect(deployed).toBe(false);
+    expect(await inboxIds()).toHaveLength(1);
   });
 
   it("builds link preview cards and blocks private addresses", async () => {
@@ -267,7 +319,7 @@ describe("build", () => {
     expect(t.fake.calls.some((c) => c.url === "https://example.com/x")).toBe(false);
   });
 
-  it("refuses to run two builds at once and never overwrites a newer database", async () => {
+  it("refuses to run two builds at once", async () => {
     await t.send(post(message({ text: "第一条" })));
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
@@ -277,35 +329,28 @@ describe("build", () => {
     release();
     await first;
     expect(texts()).toEqual(["第一条"]);
-
-    // 锁被错误接管的极端情况：部署期间数据库被别人写过，放弃回写，收件箱保留
-    await t.send(post(message({ text: "第二条" })));
-    await expect(
-      t.build({
-        deploy: async () => {
-          const b = new TextEncoder().encode("someone else");
-          await t.stores.data.put(DB_KEY, b, { contentType: "application/octet-stream", size: b.byteLength });
-        },
-      }),
-    ).rejects.toThrow("被其他进程修改");
-    expect(await listInbox(t.stores.data)).toHaveLength(1);
-    // 失败后锁已释放
-    expect(await t.stores.data.head(LOCK_KEY)).toBeNull();
+    expect(await lockRow()).toBeNull();
   });
 
-  it("gives up when the lock is taken over mid-build (stores without conditional writes)", async () => {
+  it("takes over a stale lock", async () => {
+    await t.db.run("INSERT INTO build_lock (id, token, acquired_at) VALUES (1, 'dead', ?)", [Date.now() - 2 * 60 * 60 * 1000]);
+    await t.send(post(message({ text: "接管" })));
+    expect((await t.build()).processed).toBe(1);
+    expect(await lockRow()).toBeNull();
+  });
+
+  it("gives up when the lock is taken over mid-build, leaving the inbox and the other lock alone", async () => {
     await t.send(post(message({ text: "被抢锁的那次" })));
     await expect(
       t.build({
         deploy: async () => {
-          // 模拟不支持 If-None-Match 的存储：另一个构建直接覆盖了锁
-          const b = new TextEncoder().encode(JSON.stringify({ token: "other", at: Date.now() }));
-          await t.stores.data.put(LOCK_KEY, b, { contentType: "application/json", size: b.byteLength });
+          // 这次构建超过了 TTL，另一个构建接管了锁
+          await t.db.run("UPDATE build_lock SET token = 'other', acquired_at = ?", [Date.now()]);
         },
       }),
     ).rejects.toThrow("另一个构建正在进行");
-    expect(await listInbox(t.stores.data)).toHaveLength(1); // 没有回写、没有清收件箱
-    expect(await t.stores.data.head(LOCK_KEY)).not.toBeNull(); // 别人的锁不能删
+    expect(await inboxIds()).toHaveLength(1); // 收件箱交给接管的那次构建清理
+    expect((await lockRow())?.token).toBe("other"); // 别人的锁不能删
   });
 
   it("uses the site timezone for day keys", async () => {
@@ -344,11 +389,9 @@ describe("serving", () => {
     expect(beyond.headers.get("content-range")).toBe("bytes */64");
 
     expect((await t.server.request("/m/photo/%E0")).status).toBe(404);
-    // 同一个桶里的数据库和收件箱不能被读到
+    // 媒体目录之外的路径一律 404
     expect((await t.server.request("/m/state/thought.db")).status).toBe(404);
-    await t.send(post(message({ text: "x" })));
-    const [inboxKey] = await listInbox(t.stores.data);
-    expect((await t.server.request(`/m/${inboxKey}`)).status).toBe(404);
+    expect((await t.server.request("/m/inbox/0000000000000001.json")).status).toBe(404);
     expect((await t.server.request("/m/../etc/passwd")).status).toBe(404);
   });
 });

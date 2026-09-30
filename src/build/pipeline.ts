@@ -1,22 +1,19 @@
 // 构建流程：
-//   加锁 → 取回数据库 → 重试之前失败的媒体 → 处理收件箱 → 抓链接预览（每个帖子一次）
-//   → 没有变化就结束 → 渲染 → 部署 → 核对数据库没被别人改过 → 回写数据库、清空已处理的收件箱 → 解锁
-// 部署成功之前不回写任何东西：任何一步失败，下次构建会把同样的消息重新处理一遍（入库是幂等的）。
-import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { hostname, tmpdir } from "node:os";
+//   加锁 → 重试之前失败的媒体 → 处理收件箱 → 抓链接预览（每个帖子一次）
+//   → 没有变化就结束 → 渲染 → 核对锁 → 部署 → 删掉已处理的收件箱、清掉待发布标记（都以锁仍是自己的为条件）→ 解锁
+// 入库直接写数据库，但收件箱要等部署成功才删：任何一步失败，下次构建会把同样的消息重新处理一遍（入库是幂等的）。
+// 不在收件箱里的变化（重试修好的媒体）记在 site_state.publish_pending，部署失败也不会丢。
+import { cp, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { SqliteDatabase, migrate } from "../adapters/node/sqlite";
 import type { Config } from "../core/config";
 import { renderSite } from "../core/build/site";
-import type { BlobStore, Deps, ImageOptimizer, Stores } from "../core/ports";
-import { listInbox, readUpdate } from "../core/services/inbox";
+import type { BlobStore, Database, Deps, ImageOptimizer } from "../core/ports";
+import { LOCK_HELD, clearInboxStatements, readInbox } from "../core/services/inbox";
 import { handleUpdate, telegramClient } from "../core/services/ingest";
 import { refreshLinkPreview } from "../core/services/link-preview";
 import { retryFailedMedia } from "../core/services/media";
 import type { LinkPreviewPrefs } from "../core/telegram/normalize";
 
-export const DB_KEY = "state/thought.db";
-export const LOCK_KEY = "state/build.lock";
 /** 超过这个时间的锁视为上次构建异常退出留下的，可以接管 */
 const LOCK_TTL_MS = 60 * 60 * 1000;
 
@@ -28,17 +25,19 @@ export class BuildLockedError extends Error {
 
 export interface BuildOptions {
   config: Config;
-  stores: Stores;
+  /** 数据库（D1 或本地 SQLite），迁移需要事先执行 */
+  db: Database;
+  /** 媒体存储 */
+  media: BlobStore;
   fetch?: typeof fetch;
   /** 转存图片前压缩；不传就原样存 */
   optimizeImage?: ImageOptimizer;
   /** 静态站点输出目录（整体替换） */
   outDir: string;
   publicDir: string;
-  migrationsDir: string;
   /** 没有新消息也重新构建（改了模板 / 首次部署） */
   force?: boolean;
-  /** 渲染完成后执行，失败则不回写 */
+  /** 渲染完成后执行，失败则不清理收件箱 */
   deploy?: () => Promise<void>;
   now?: number;
   log?: (msg: string) => void;
@@ -53,134 +52,88 @@ export interface BuildResult {
   files: number;
 }
 
-interface LockInfo {
-  token: string;
-  at: number;
-}
-
-async function readLock(data: BlobStore): Promise<LockInfo | null> {
-  const held = await data.get(LOCK_KEY);
-  if (!held) return null;
-  try {
-    return JSON.parse(await new Response(held.body).text()) as LockInfo;
-  } catch {
-    return { token: "", at: 0 };
-  }
-}
-
 /**
- * 用「不存在才创建」拿锁，锁里放随机令牌。拿到后读回核对一次：
- * 不支持条件写入的 S3 兼容服务会直接覆盖，读回的令牌对不上就说明被别人抢了。
+ * 锁表只有一行：没有就插入，有但已过期就接管，一条语句完成，不会两个构建同时拿到。
+ * RETURNING 只在真正写入时返回行，所以返回了令牌就是拿到了锁。
  */
-async function acquireLock(data: BlobStore, log: (m: string) => void): Promise<string> {
+async function acquireLock(db: Database): Promise<string> {
   const token = crypto.randomUUID();
-  const body = () => new TextEncoder().encode(JSON.stringify({ token, at: Date.now(), host: hostname(), pid: process.pid }));
-  const opts = { contentType: "application/json" };
-  let created = await data.create(LOCK_KEY, body(), opts);
-  if (!created) {
-    const held = await readLock(data);
-    const since = held?.at ?? 0;
-    if (held && Date.now() - since < LOCK_TTL_MS) throw new BuildLockedError(since);
-    log("发现过期的构建锁，接管");
-    await data.delete(LOCK_KEY);
-    created = await data.create(LOCK_KEY, body(), opts);
-    if (!created) throw new BuildLockedError(Date.now());
-  }
-  await assertLockHeld(data, token);
-  return token;
+  const now = Date.now();
+  const got = await db.first<{ token: string }>(
+    `INSERT INTO build_lock (id, token, acquired_at) VALUES (1, ?, ?)
+     ON CONFLICT (id) DO UPDATE SET token = excluded.token, acquired_at = excluded.acquired_at
+     WHERE build_lock.acquired_at < ?
+     RETURNING token`,
+    [token, now, now - LOCK_TTL_MS],
+  );
+  if (got?.token === token) return token;
+  const held = await db.first<{ acquired_at: number }>("SELECT acquired_at FROM build_lock WHERE id = 1");
+  throw new BuildLockedError(held?.acquired_at ?? now);
 }
 
-async function assertLockHeld(data: BlobStore, token: string): Promise<void> {
-  const held = await readLock(data);
-  if (held?.token !== token) throw new BuildLockedError(held?.at ?? Date.now());
+/** 锁被别人接管过（例如这次构建超过了 TTL）就停下：那边会处理同一批消息 */
+async function assertLockHeld(db: Database, token: string): Promise<void> {
+  if (!(await db.first("SELECT 1 AS ok FROM build_lock WHERE id = 1 AND token = ?", [token]))) throw new BuildLockedError(Date.now());
 }
 
 export async function runBuild(opts: BuildOptions): Promise<BuildResult> {
   const log = opts.log ?? ((m: string) => console.log(m));
-  const { data, media } = opts.stores;
-  const token = await acquireLock(data, log);
-  let ownsLock = true;
-  const work = await mkdtemp(join(tmpdir(), "thought-build-"));
-  const dbPath = join(work, "thought.db");
+  const { db } = opts;
+  const token = await acquireLock(db);
   try {
-    const keys = await listInbox(data);
-    log(`收件箱：${keys.length} 条`);
+    const inbox = await readInbox(db);
+    log(`收件箱：${inbox.length} 条`);
+    const deps: Deps = { config: opts.config, db, blobs: opts.media, fetch: opts.fetch ?? fetch, optimizeImage: opts.optimizeImage };
 
-    const saved = await data.get(DB_KEY);
-    const baseEtag = saved?.etag ?? null;
-    if (saved) await writeFile(dbPath, new Uint8Array(await new Response(saved.body).arrayBuffer()));
+    // 先重试之前失败的媒体，再处理新消息：这次刚失败的不会在同一次构建里被重复下载
+    const retry = await retryFailedMedia(deps, telegramClient(deps));
+    if (retry.attempted) log(`重试失败的媒体：${retry.fixed} / ${retry.attempted} 成功`);
+    // 重试结果已经写进数据库、但还没发布：先记下来，这次部署失败的话下次构建照样会重新渲染
+    if (retry.fixed) await db.run(`UPDATE site_state SET publish_pending = 1 WHERE id = 1 AND ${LOCK_HELD}`, [token]);
 
-    const db = new SqliteDatabase(dbPath);
-    let result: BuildResult;
-    let dbChanged: boolean;
-    try {
-      const applied = migrate(db, opts.migrationsDir);
-      if (applied.length) log(`执行迁移：${applied.join(", ")}`);
-      const deps: Deps = { config: opts.config, db, blobs: media, fetch: opts.fetch ?? fetch, optimizeImage: opts.optimizeImage };
-
-      // 先重试之前失败的媒体，再处理新消息：这次刚失败的不会在同一次构建里被重复下载
-      const retry = await retryFailedMedia(deps, telegramClient(deps));
-      if (retry.attempted) log(`重试失败的媒体：${retry.fixed} / ${retry.attempted} 成功`);
-
-      // 同一个帖子在这一批里可能有原消息和多次编辑，链接预览只按最后一次抓
-      const previews = new Map<number, LinkPreviewPrefs | undefined>();
-      for (const key of keys) {
-        const update = await readUpdate(data, key);
-        if (!update) {
-          log(`跳过无法解析的 ${key}`);
-          continue;
-        }
-        const r = await handleUpdate(deps, update);
-        log(`${key} → ${r.action}${r.action === "ignored" ? `（${r.reason}）` : ""}`);
-        if (r.action === "saved" && r.textOnly) previews.set(r.postId, r.prefs);
+    // 同一个帖子在这一批里可能有原消息和多次编辑，链接预览只按最后一次抓
+    const previews = new Map<number, LinkPreviewPrefs | undefined>();
+    for (const { updateId, update } of inbox) {
+      if (!update) {
+        log(`跳过无法解析的 update ${updateId}`);
+        continue;
       }
-      await Promise.all(
-        [...previews].map(([postId, prefs]) =>
-          refreshLinkPreview(deps, postId, prefs).catch((e) => log(`链接预览失败（帖子 ${postId}）：${(e as Error).message}`)),
-        ),
-      );
-
-      const siteChanged = keys.length > 0 || retry.fixed > 0;
-      // 重试即使全部失败，重试次数也变了，要回写，否则永远到不了上限
-      dbChanged = siteChanged || retry.attempted > 0;
-      if (!siteChanged && !opts.force) {
-        log("没有新内容，跳过构建");
-        result = { changed: false, processed: 0, retried: 0, posts: 0, files: 0 };
-      } else {
-        const site = await render(deps, opts);
-        log(`渲染完成：${site.posts} 条帖子，${site.files} 个文件`);
-        result = { changed: true, processed: keys.length, retried: retry.fixed, ...site };
-      }
-    } finally {
-      db.close(); // 关闭时 WAL 会合并回主文件
+      const r = await handleUpdate(deps, update);
+      log(`${updateId} → ${r.action}${r.action === "ignored" ? `（${r.reason}）` : ""}`);
+      if (r.action === "saved" && r.textOnly) previews.set(r.postId, r.prefs);
     }
+    await Promise.all(
+      [...previews].map(([postId, prefs]) =>
+        refreshLinkPreview(deps, postId, prefs).catch((e) => log(`链接预览失败（帖子 ${postId}）：${(e as Error).message}`)),
+      ),
+    );
 
-    if (result.changed && opts.deploy) {
+    const pending = (await db.first<{ p: number }>("SELECT publish_pending AS p FROM site_state WHERE id = 1"))?.p === 1;
+    const siteChanged = inbox.length > 0 || pending;
+    if (!siteChanged && !opts.force) {
+      log("没有新内容，跳过构建");
+      return { changed: false, processed: 0, retried: 0, posts: 0, files: 0 };
+    }
+    const site = await render(deps, opts);
+    log(`渲染完成：${site.posts} 条帖子，${site.files} 个文件`);
+
+    // 部署前再核对一次：锁被接管了就不要用这份（可能更旧的）渲染结果覆盖对方的部署
+    await assertLockHeld(db, token);
+    if (opts.deploy) {
       log("部署中…");
       await opts.deploy();
     }
-    if (dbChanged) {
-      // 回写前再核对两道：锁还是自己的、数据库没被别人改过，任何一项不满足都放弃回写
-      try {
-        await assertLockHeld(data, token);
-      } catch (e) {
-        ownsLock = false;
-        throw e;
-      }
-      const current = (await data.head(DB_KEY))?.etag ?? null;
-      if (current !== baseEtag) throw new Error("数据库在构建期间被其他进程修改，放弃回写（下次构建会重新处理）");
-      const bytes = new Uint8Array(await readFile(dbPath));
-      await data.put(DB_KEY, bytes, { contentType: "application/vnd.sqlite3", size: bytes.byteLength });
-      for (const key of keys) await data.delete(key);
-      log(keys.length ? "数据库已回写，收件箱已清理" : "数据库已回写");
-    }
-    return result;
+    await assertLockHeld(db, token);
+    // 以锁仍是自己的为条件，和检查在同一条语句里：即使恰好在这之间被接管，也不会删掉对方正在处理的记录
+    await db.batch([
+      ...clearInboxStatements(inbox.map((i) => i.updateId), token),
+      { sql: `UPDATE site_state SET publish_pending = 0 WHERE id = 1 AND ${LOCK_HELD}`, params: [token] },
+    ]);
+    if (inbox.length) log("收件箱已清理");
+    return { changed: true, processed: inbox.length, retried: retry.fixed, ...site };
   } finally {
-    await rm(work, { recursive: true, force: true });
     // 只释放自己的锁；被别人接管的锁不能删
-    if (ownsLock && (await readLock(data).catch(() => null))?.token === token) {
-      await data.delete(LOCK_KEY).catch((e) => log(`释放构建锁失败：${(e as Error).message}`));
-    }
+    await db.run("DELETE FROM build_lock WHERE id = 1 AND token = ?", [token]).catch((e) => log(`释放构建锁失败：${(e as Error).message}`));
   }
 }
 

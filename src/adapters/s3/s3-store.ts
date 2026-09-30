@@ -43,18 +43,6 @@ export class S3BlobStore implements BlobStore {
     if (!res.ok) throw new Error(`S3 PUT ${key}: ${res.status} ${await res.text()}`);
   }
 
-  async create(key: string, body: Uint8Array<ArrayBuffer>, opts: BlobPutOptions): Promise<boolean> {
-    // 条件写入：R2 和 AWS S3 都支持 If-None-Match: *，对象已存在时返回 412
-    const res = await this.client.fetch(`${this.base}/${encodeKey(key)}`, {
-      method: "PUT",
-      body,
-      headers: { "content-type": opts.contentType, "if-none-match": "*" },
-    });
-    if (res.status === 412 || res.status === 409) return false;
-    if (!res.ok) throw new Error(`S3 PUT(if-none-match) ${key}: ${res.status} ${await res.text()}`);
-    return true;
-  }
-
   async head(key: string): Promise<{ size: number; etag: string } | null> {
     const res = await this.client.fetch(`${this.base}/${encodeKey(key)}`, { method: "HEAD" });
     if (res.status === 404) return null;

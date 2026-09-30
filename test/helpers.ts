@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createNodeServer } from "../src/adapters/node";
 import { FsBlobStore } from "../src/adapters/node/fs-store";
+import { SqliteDatabase, migrate } from "../src/adapters/node/sqlite";
 import { runBuild, type BuildOptions } from "../src/build/pipeline";
 import type { SiteIndex } from "../src/core/build/site";
 import { loadConfig } from "../src/core/config";
@@ -69,9 +70,11 @@ export function createTestEnv(env: Record<string, string> = {}) {
     SITE_URL: "https://site.test",
     ...env,
   });
-  const stores = { media: new FsBlobStore(join(dir, "media")), data: new FsBlobStore(join(dir, "private")) };
+  const db = new SqliteDatabase(join(dir, "thought.db"));
+  migrate(db, resolve("migrations"));
+  const media = new FsBlobStore(join(dir, "media"));
   const siteDir = join(dir, "site");
-  const server = createNodeServer({ config, stores, fetch: fake.fn, siteDir });
+  const server = createNodeServer({ config, db, media, fetch: fake.fn, siteDir });
 
   const send = (update: TgUpdate, secret = SECRET) =>
     server.request("/tg/webhook", {
@@ -83,11 +86,11 @@ export function createTestEnv(env: Record<string, string> = {}) {
   const build = (opts: Partial<BuildOptions> = {}) =>
     runBuild({
       config,
-      stores,
+      db,
+      media,
       fetch: fake.fn,
       outDir: siteDir,
       publicDir: resolve("public"),
-      migrationsDir: resolve("migrations"),
       log: () => {},
       ...opts,
     });
@@ -102,7 +105,11 @@ export function createTestEnv(env: Record<string, string> = {}) {
     return (JSON.parse(file(`data/month/${entry.d.slice(0, 7)}.json`)) as Record<string, string>)[id] ?? null;
   };
 
-  return { dir, config, stores, server, fake, send, build, file, exists, index, postHtml, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  const cleanup = () => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  };
+  return { dir, config, db, media, server, fake, send, build, file, exists, index, postHtml, cleanup };
 }
 
 let updateId = 1;

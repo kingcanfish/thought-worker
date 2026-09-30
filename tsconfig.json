@@ -15,5 +15,5 @@
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx"
   },
-  "include": ["src/core", "src/adapters/node", "src/adapters/s3", "src/build", "scripts", "test"]
+  "include": ["src/core", "src/adapters/node", "src/adapters/s3", "src/adapters/d1", "src/build", "scripts", "test"]
 }

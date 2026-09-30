@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -44,25 +44,6 @@ export class FsBlobStore implements BlobStore {
       await rm(tmp, { force: true });
       throw e;
     }
-  }
-
-  async create(key: string, body: Uint8Array<ArrayBuffer>, opts: BlobPutOptions): Promise<boolean> {
-    const p = this.path(key);
-    await mkdir(dirname(p), { recursive: true });
-    let handle;
-    try {
-      handle = await open(p, "wx"); // 已存在时原子地失败
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw e;
-    }
-    try {
-      await handle.writeFile(body);
-    } finally {
-      await handle.close();
-    }
-    await writeFile(`${p}.meta.json`, JSON.stringify({ contentType: opts.contentType } satisfies Meta));
-    return true;
   }
 
   async head(key: string): Promise<{ size: number; etag: string } | null> {

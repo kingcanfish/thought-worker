@@ -51,8 +51,6 @@ export class RangeNotSatisfiableError extends Error {
 /** 对象存储（R2、S3、本地磁盘 …） */
 export interface BlobStore {
   put(key: string, body: BlobBody, opts: BlobPutOptions): Promise<void>;
-  /** 仅当 key 不存在时写入，返回是否写入成功（用于构建锁） */
-  create(key: string, body: Uint8Array<ArrayBuffer>, opts: BlobPutOptions): Promise<boolean>;
   /** 只取元信息，不存在返回 null */
   head(key: string): Promise<{ size: number; etag: string } | null>;
   /** 不存在返回 null；区间无法满足抛 RangeNotSatisfiableError */
@@ -63,16 +61,7 @@ export interface BlobStore {
 }
 
 /**
- * 两个存储分开：media 只放图片视频（可以整体公开，例如绑定 R2 自定义域名直出）；
- * data 放收件箱和数据库文件，永远不能公开。
- */
-export interface Stores {
-  media: BlobStore;
-  data: BlobStore;
-}
-
-/**
- * 图片压缩（构建端可选）：返回压缩后的内容；不支持的格式、或压缩后没有变小时返回 null，保留原图。
+ * 图片压缩（构建端可选）：返回压缩后的内容；不支持的格式、动图、或压缩后没有变小时返回 null，保留原图。
  */
 export type ImageOptimizer = (bytes: Uint8Array, mime: string) => Promise<{ bytes: Uint8Array; mime: string } | null>;
 
@@ -97,7 +86,10 @@ export interface MediaCache {
 /** 接收端依赖 */
 export interface ReceiverDeps {
   config: Config;
-  stores: Stores;
+  /** 收件箱在数据库里（inbox 表） */
+  db: Database;
+  /** 媒体存储，只放图片视频 */
+  media: BlobStore;
   fetch: typeof fetch;
   mediaCache?: MediaCache;
 }

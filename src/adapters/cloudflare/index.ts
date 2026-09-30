@@ -4,13 +4,14 @@ import type { Context } from "hono";
 import { loadConfig } from "../../core/config";
 import { createReceiverApp } from "../../core/http/app";
 import type { MediaCache } from "../../core/ports";
+import { D1Adapter } from "./d1";
 import { R2Adapter } from "./r2";
 
 interface Env {
-  /** 图片视频，可以公开 */
+  /** 图片视频 */
   MEDIA: R2Bucket;
-  /** 收件箱、数据库，不能公开 */
-  DATA: R2Bucket;
+  /** 帖子、收件箱、构建锁 */
+  DB: D1Database;
   ASSETS: Fetcher;
   [key: string]: unknown;
 }
@@ -33,7 +34,8 @@ const app = createReceiverApp((c) => {
   const env = c.env as Env;
   return {
     config: loadConfig(env),
-    stores: { media: new R2Adapter(env.MEDIA), data: new R2Adapter(env.DATA) },
+    db: new D1Adapter(env.DB),
+    media: new R2Adapter(env.MEDIA),
     fetch: (input, init) => fetch(input, init),
     mediaCache: edgeCache(c),
   };

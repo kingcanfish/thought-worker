@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { guardedFetch, isPublicHttpUrl } from "../src/core/lib/url-guard";
-import { inboxKey } from "../src/core/services/inbox";
 
 describe("isPublicHttpUrl", () => {
   it.each([
@@ -48,11 +47,5 @@ describe("guardedFetch", () => {
       String(input) === "https://a.test/" ? new Response(null, { status: 301, headers: { location: "/b" } }) : new Response("ok");
     const r = await guardedFetch(fake, "https://a.test/");
     expect(r?.url).toBe("https://a.test/b");
-  });
-});
-
-describe("inboxKey", () => {
-  it("sorts by update_id", () => {
-    expect([inboxKey(100), inboxKey(9), inboxKey(10)].sort()).toEqual([inboxKey(9), inboxKey(10), inboxKey(100)]);
   });
 });

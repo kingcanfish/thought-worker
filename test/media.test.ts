@@ -8,7 +8,7 @@ import { createTestEnv, message, photo, post } from "./helpers";
 
 let t: ReturnType<typeof createTestEnv>;
 beforeEach(() => {
-  t = createTestEnv({ MEDIA_ALLOWED_REFERERS: "friend.test, Reader.test" });
+  t = createTestEnv({ MEDIA_ALLOWED_REFERERS: "friend.test, Reader.test, https://pal.test/blog/" });
 });
 afterEach(() => t.cleanup());
 
@@ -27,6 +27,14 @@ describe("hotlink protection", () => {
     expect((await get("http://localhost/m/photo/h1-u.jpg", { referer: "http://localhost/" })).status).toBe(200);
     expect((await get("/m/photo/h1-u.jpg", { referer: "https://friend.test/x" })).status).toBe(200);
     expect((await get("/m/photo/h1-u.jpg", { referer: "https://reader.test/" })).status).toBe(200);
+    // 白名单写成完整地址也按 host 匹配
+    expect((await get("/m/photo/h1-u.jpg", { referer: "https://pal.test/x" })).status).toBe(200);
+  });
+
+  it("lets people open media from links on other sites, but not embed it", async () => {
+    const referer = "https://forum.test/thread/1";
+    expect((await get("/m/photo/h1-u.jpg", { referer, "sec-fetch-dest": "document" })).status).toBe(200);
+    expect((await get("/m/photo/h1-u.jpg", { referer, "sec-fetch-dest": "image" })).status).toBe(403);
   });
 
   it("blocks other sites and malformed referers without caching the refusal", async () => {
@@ -43,7 +51,7 @@ describe("edge cache", () => {
   /** 记录读取次数的媒体存储 + 用 Map 模拟的缓存（按键存完整响应，命中时原样返回） */
   function setup() {
     let reads = 0;
-    const media: BlobStore = new Proxy(t.stores.media, {
+    const media: BlobStore = new Proxy(t.media, {
       get(target, prop, receiver) {
         if (prop === "get") return (...args: Parameters<BlobStore["get"]>) => (reads++, target.get(...args));
         return Reflect.get(target, prop, receiver);
@@ -54,7 +62,7 @@ describe("edge cache", () => {
       match: async (key) => store.get(key)?.clone(),
       put: (key, res) => void store.set(key, res),
     };
-    const app = createReceiverApp(() => ({ config: t.config, stores: { media, data: t.stores.data }, fetch: t.fake.fn, mediaCache: cache }));
+    const app = createReceiverApp(() => ({ config: t.config, db: t.db, media, fetch: t.fake.fn, mediaCache: cache }));
     return { app, store, reads: () => reads };
   }
 
@@ -99,10 +107,10 @@ describe("image optimization", () => {
     const html = t.postHtml(entry!.id)!;
     expect(html).toContain("/m/photo/o1-u.webp");
     expect(html).toContain("/m/thumb/o1-um.webp");
-    const obj = await t.stores.media.get("photo/o1-u.webp");
+    const obj = await t.media.get("photo/o1-u.webp");
     expect(obj?.size).toBe(10);
     expect(obj?.contentType).toBe("image/webp");
-    expect(await t.stores.media.head("photo/o1-u.jpg")).toBeNull();
+    expect(await t.media.head("photo/o1-u.jpg")).toBeNull();
   });
 
   it("keeps the original when the optimizer fails or does not help", async () => {
@@ -111,8 +119,8 @@ describe("image optimization", () => {
     await t.build({ optimizeImage: createImageOptimizer({ quality: 80, maxSide: 2560, maxBytes: 2 * 1024 * 1024 }) });
     await t.send(post(message({ photo: photo("o3") })));
     await t.build({ optimizeImage: async (bytes) => ({ bytes: new Uint8Array(bytes.byteLength * 2), mime: "image/webp" }) });
-    expect(await t.stores.media.head("photo/o2-u.jpg")).not.toBeNull();
-    expect(await t.stores.media.head("photo/o3-u.jpg")).not.toBeNull();
+    expect(await t.media.head("photo/o2-u.jpg")).not.toBeNull();
+    expect(await t.media.head("photo/o3-u.jpg")).not.toBeNull();
     expect(t.index().posts).toHaveLength(2);
   });
 
@@ -153,6 +161,22 @@ describe("image optimization", () => {
     const small = await sharp({ create: { width: 1200, height: 800, channels: 3, background: "#88aacc" } }).jpeg().toBuffer();
     const kept = await createImageOptimizer({ quality: 80, maxSide: 2560, maxBytes: limit })(new Uint8Array(small), "image/jpeg");
     expect((await sharp(kept!.bytes).metadata()).width).toBe(1200);
+  });
+
+  it("keeps animated WebP untouched instead of flattening it to one frame", async () => {
+    const frame = (c: string) => sharp({ create: { width: 64, height: 64, channels: 3, background: c } }).png().toBuffer();
+    const animated = await sharp(await Promise.all(["#f00", "#0f0", "#00f"].map(frame)), { join: { animated: true } })
+      .webp({ lossless: true })
+      .toBuffer();
+    expect((await sharp(animated).metadata()).pages).toBe(3);
+    const optimize = createImageOptimizer({ quality: 80, maxSide: 2560, maxBytes: 2 * 1024 * 1024 });
+    expect(await optimize(new Uint8Array(animated), "image/webp")).toBeNull();
+  });
+
+  it("returns null when re-encoding would not make the image smaller", async () => {
+    const optimize = createImageOptimizer({ quality: 80, maxSide: 2560, maxBytes: 2 * 1024 * 1024 });
+    const tiny = await sharp({ create: { width: 8, height: 8, channels: 3, background: "#123456" } }).webp({ quality: 10 }).toBuffer();
+    expect(await optimize(new Uint8Array(tiny), "image/webp")).toBeNull();
   });
 
   it("leaves GIFs and unknown formats alone", async () => {

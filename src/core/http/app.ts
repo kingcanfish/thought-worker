@@ -7,7 +7,7 @@ export type AppEnv = { Variables: { deps: ReceiverDeps } };
 
 /**
  * 接收端：只有两个动态路由，其余都是构建出来的静态文件（由平台直接提供）。
- *   POST /tg/webhook  校验后把 update 原样存进收件箱（data 存储）
+ *   POST /tg/webhook  校验后把 update 原样写进收件箱（数据库 inbox 表）
  *   GET  /m/*         MEDIA_BASE=/m 时转发媒体存储里的文件
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

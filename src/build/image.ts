@@ -1,9 +1,7 @@
 // 构建端的图片压缩（sharp）：转成 WebP，限制最长边和文件大小。核心代码只依赖 ImageOptimizer 接口
 import sharp from "sharp";
 import type { ImageOptimizer } from "../core/ports";
-
-/** GIF 可能是动图，HEIC 等浏览器不一定能显示的格式本来就不会转存，都不处理 */
-const INPUT = new Set(["image/jpeg", "image/png", "image/webp"]);
+import { OPTIMIZABLE_IMAGES } from "../core/services/media";
 
 /** 超过大小上限时，质量最低降到这里，再往下就改为缩小尺寸 */
 const MIN_QUALITY = 50;
@@ -22,22 +20,28 @@ export interface ImageOptions {
 
 export function createImageOptimizer({ quality, maxSide, maxBytes }: ImageOptions): ImageOptimizer {
   return async (bytes, mime) => {
-    if (!INPUT.has(mime)) return null;
-    // 先解码并转正一次，之后每轮只重新编码
-    const { data, info } = await sharp(bytes, { failOn: "none" })
+    if (!OPTIMIZABLE_IMAGES.has(mime)) return null;
+    const input = sharp(bytes, { failOn: "none" });
+    // 动图 WebP / APNG：sharp 默认只解码第一帧，压出来就成了静态图，保留原图
+    if (((await input.metadata()).pages ?? 1) > 1) return null;
+
+    // 解码、转正、先缩到最长边以内，只做一次；之后每轮从这份像素重新编码，不必每次处理全尺寸原图
+    const { data, info } = await input
       .rotate() // 按 EXIF 方向转正；输出默认不带 EXIF（原图里的 GPS 等信息一并去掉）
+      .resize({ width: maxSide, height: maxSide, fit: "inside", withoutEnlargement: true })
       .raw()
       .toBuffer({ resolveWithObject: true });
-    const source = () => sharp(data, { raw: { width: info.width, height: info.height, channels: info.channels } });
+    const pixels = () => sharp(data, { raw: { width: info.width, height: info.height, channels: info.channels } });
 
-    let side = Math.min(maxSide, Math.max(info.width, info.height));
+    const full = Math.max(info.width, info.height);
+    let side = full;
     let q = quality;
     for (;;) {
-      const out = await source()
-        .resize({ width: side, height: side, fit: "inside", withoutEnlargement: true })
-        .webp({ quality: q, smartSubsample: true })
-        .toBuffer();
-      if (out.byteLength <= maxBytes || side <= MIN_SIDE) return { bytes: new Uint8Array(out), mime: "image/webp" };
+      const img = side < full ? pixels().resize({ width: side, height: side, fit: "inside" }) : pixels();
+      const out = await img.webp({ quality: q, smartSubsample: true }).toBuffer();
+      if (out.byteLength <= maxBytes || side <= MIN_SIDE) {
+        return out.byteLength < bytes.byteLength ? { bytes: new Uint8Array(out), mime: "image/webp" } : null;
+      }
       if (q > MIN_QUALITY) q = Math.max(MIN_QUALITY, q - 10);
       else side = Math.max(MIN_SIDE, Math.round(side * SHRINK));
     }

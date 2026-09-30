@@ -98,10 +98,10 @@ async function saveMedia(deps: Deps, tg: TelegramClient, postId: number, message
     "SELECT file_unique_id, status FROM media WHERE post_id = ? AND message_id = ?",
     [postId, messageId],
   );
-  // 同一个文件已经处理过（重复投递 / 只改了文字的编辑），跳过；失败的会重试
-  if (existing?.file_unique_id === ref.fileUniqueId && (existing.status === "ready" || existing.status === "too_large")) {
-    return;
-  }
+  // 同一个文件已经处理过（重复投递 / 只改了文字的编辑 / 部署失败后重新处理收件箱），跳过。
+  // 失败的也跳过：统一交给 retryFailedMedia 重试，它在处理收件箱之前运行、并累计 attempts，
+  // 这里再下载一次会在同一次构建里重复下载，还会把 attempts 重置为 1、永远到不了上限
+  if (existing?.file_unique_id === ref.fileUniqueId && existing.status !== "pending") return;
 
   // 同一个文件在别的帖子里已经转存过（例如重复转发），直接复用
   const reuse = await deps.db.first<{ blob_key: string; thumb_key: string | null; mime: string | null; size: number | null }>(

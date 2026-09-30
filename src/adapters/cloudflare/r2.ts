@@ -20,15 +20,6 @@ export class R2Adapter implements BlobStore {
     await this.bucket.put(key, await new Response(body).arrayBuffer(), { httpMetadata });
   }
 
-  async create(key: string, body: Uint8Array<ArrayBuffer>, opts: BlobPutOptions): Promise<boolean> {
-    // 条件写入：对象已存在时 put 返回 null
-    const r = await this.bucket.put(key, body, {
-      httpMetadata: { contentType: opts.contentType },
-      onlyIf: new Headers({ "if-none-match": "*" }),
-    });
-    return r !== null;
-  }
-
   async head(key: string): Promise<{ size: number; etag: string } | null> {
     const h = await this.bucket.head(key);
     return h ? { size: h.size, etag: h.httpEtag } : null;

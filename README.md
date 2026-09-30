@@ -2,8 +2,8 @@
 
 在 Telegram 频道里发碎碎念（文字 / 图片 / 视频），网站每天自动更新一次。
 
-- **接收端**：一个很小的 Cloudflare Worker，收到 webhook 就把消息原样存进 R2（`/del` 会立即删除频道里的消息）
-- **构建端**：GitHub Actions 每天定时跑一次，把新消息入库、转存图片视频，生成整站静态文件并部署；没有新消息就不构建
+- **接收端**：一个很小的 Cloudflare Worker，收到 webhook 就把消息原样写进 D1 的收件箱（`/del` 会立即删除频道里的消息）
+- **构建端**：GitHub Actions 每天定时跑一次，把新消息入库、转存图片视频（图片压缩成 WebP），生成整站静态文件并部署；没有新消息就不构建
 - **网站**：纯静态文件，筛选 / 搜索 / 翻页都在浏览器里完成
 - 核心代码与平台无关，同一份代码也能用 **Node / Docker 部署到自己的服务器**
 
@@ -23,16 +23,17 @@
 ```bash
 npm install
 npx wrangler login
-npx wrangler r2 bucket create thought-worker-media   # 图片视频，以后可以公开
-npx wrangler r2 bucket create thought-worker-data    # 收件箱和数据库，永远不要公开
+npx wrangler r2 bucket create thought-worker-media   # 图片视频，不要开公开访问
+npx wrangler d1 create thought-worker                # 帖子 + 收件箱；把输出的 database_id 填进 wrangler.toml
+npx wrangler d1 migrations apply thought-worker --remote
 ```
 
 在 Cloudflare 后台再创建两个 token：
 
-- **R2 API Token**（R2 → Manage API Tokens，权限 Object Read & Write，限定这两个桶）：得到 Access Key ID 和 Secret Access Key。
-- **API Token**（My Profile → API Tokens，用「Edit Cloudflare Workers」模板）：给 GitHub Actions 部署用。
+- **R2 API Token**（R2 → Manage API Tokens，权限 Object Read & Write，只限定 `thought-worker-media`）：得到 Access Key ID 和 Secret Access Key。
+- **API Token**（My Profile → API Tokens，用「Edit Cloudflare Workers」模板，**再加一项 Account → D1 → Edit**）：给 GitHub Actions 迁移、部署、读写 D1 用。
 
-> R2 需要先在后台绑定支付方式才能开通（免费额度内不扣费）。
+> R2 需要先在后台绑定支付方式才能开通。Cloudflare 没有消费上限，只要桶不公开、Workers 留在免费版，R2 读取就被每天 10 万次 Worker 请求封顶（见 [DESIGN §2.2](docs/DESIGN.md)）；建议在 Billing 里设一个 $1 的预算提醒。
 
 ### 3. 填站点配置
 
@@ -47,9 +48,9 @@ npx wrangler r2 bucket create thought-worker-data    # 收件箱和数据库，�
 | Secret | 值 |
 | --- | --- |
 | `BOT_TOKEN` | Bot token |
-| `R2_ACCOUNT_ID` | Cloudflare 账户 ID |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 API Token |
-| `CLOUDFLARE_API_TOKEN` | 部署用的 API Token |
+| `CLOUDFLARE_API_TOKEN` | 部署用的 API Token（含 D1 编辑权限） |
 
 ### 5. 首次部署
 
@@ -68,7 +69,7 @@ npm run tg:webhook -- --info      # 确认 last_error_message 为空
 
 ## 部署到自己的服务器
 
-需要 Node ≥ 22.13（用到内置的 `node:sqlite`），数据都在 `DATA_DIR`：`media/`（图片视频）和 `private/`（收件箱 + 数据库）。
+需要 Node ≥ 22.13（用到内置的 `node:sqlite`），数据都在 `DATA_DIR`：`thought.db`（帖子 + 收件箱，接收端和构建端共用）和 `media/`（图片视频）。
 
 ```bash
 cp .env.example .env     # 填 BOT_TOKEN、WEBHOOK_SECRET，STORAGE=fs
@@ -128,16 +129,17 @@ npm run dev               # 或用 wrangler dev 在 Workers 运行时里跑（�
 | `SITE_URL` | 站点地址，RSS 和分享卡片要用 | — |
 | `SITE_TZ` | 按天分组、日期筛选用的时区 | Asia/Shanghai |
 | `MEDIA_BASE` | 媒体地址前缀：`/m`（Worker 转发）或对象存储直出域名 | /m |
-| `MEDIA_ALLOWED_REFERERS` | 防盗链：除本站和 `SITE_URL` 外，还允许引用 `/m` 媒体的站点，逗号分隔的 host（没有 Referer 的请求总是放行） | — |
+| `MEDIA_ALLOWED_REFERERS` | 防盗链：除本站和 `SITE_URL` 外，还允许嵌入 `/m` 媒体的站点，逗号分隔（写 host 或完整地址都行；没有 Referer 的请求和页面跳转总是放行） | — |
 | `PAGE_SIZE` | 每次加载的条数 | 20 |
-| `STORAGE` | `fs`（本地磁盘）/ `r2` / `s3` | fs |
-| `DATA_DIR` | `STORAGE=fs` 时的数据目录（`media/` + `private/`） | ./data |
+| `DB` | 数据库：`sqlite`（`DATA_DIR/thought.db`）/ `d1`（需要 `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN`、`D1_DATABASE_ID`） | sqlite |
+| `STORAGE` | 媒体存储：`fs`（本地磁盘）/ `r2` / `s3` | fs |
+| `DATA_DIR` | 数据目录（`thought.db` + `media/`） | ./data |
 | `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | `STORAGE=r2` | — |
-| `R2_BUCKET` / `R2_DATA_BUCKET` | 媒体桶 / 数据桶（必须是两个桶） | thought-worker-media / thought-worker-data |
-| `S3_ENDPOINT` / `S3_BUCKET` / `S3_DATA_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` | `STORAGE=s3`（存储需支持 `If-None-Match` 条件写入，构建锁才能互斥） | — |
+| `R2_BUCKET` | 媒体桶 | thought-worker-media |
+| `S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` | `STORAGE=s3`（MinIO / AWS S3 / Backblaze B2 …） | — |
 | `SITE_DIR` | 站点输出目录 | ./dist/site |
 | `FORCE` | 没有新消息也构建 | — |
-| `DEPLOY_COMMAND` | 渲染后执行的部署命令，成功后才回写数据 | — |
+| `DEPLOY_COMMAND` | 渲染后执行的部署命令，成功后才清理收件箱 | — |
 | `MAX_DOWNLOAD_BYTES` | 超过的文件只存封面 | 20MB |
 | `IMAGE_OPTIMIZE` | 设为 `0` 时不压缩，图片原样转存 | 压缩 |
 | `IMAGE_QUALITY` / `IMAGE_MAX_SIDE` | 转存图片时转成 WebP 的质量 / 最长边（没变小就保留原图） | 80 / 2560 |

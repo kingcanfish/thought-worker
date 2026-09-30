@@ -4,13 +4,14 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadConfig } from "../../core/config";
 import { createNodeServer } from "./index";
-import { storesFromEnv } from "../../build/storage";
+import { databaseFromEnv, mediaFromEnv } from "../../build/storage";
 
 for (const f of ["site.env", ".env"]) if (existsSync(f)) process.loadEnvFile(f);
 
 const app = createNodeServer({
   config: loadConfig(process.env),
-  stores: storesFromEnv(process.env),
+  db: databaseFromEnv(process.env, resolve("migrations")).db,
+  media: mediaFromEnv(process.env),
   siteDir: resolve(process.env.SITE_DIR ?? "./dist/site"),
 });
 const port = Number(process.env.PORT ?? 8787);

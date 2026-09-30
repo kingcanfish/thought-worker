@@ -16,6 +16,8 @@ export interface Config {
   /** 除本站外，还允许哪些站点（host）引用 /m 的媒体；没有 Referer 的请求总是放行 */
   mediaReferers: string[];
   maxDownloadBytes: number;
+  /** 构建端转存图片时压缩成 WebP（见 src/build/image.ts） */
+  image: { optimize: boolean; quality: number; maxSide: number; maxBytes: number };
   telegramApiBase: string;
   pageSize: number;
 }
@@ -26,6 +28,15 @@ const str = (env: Env, key: string): string | null => {
   const v = env[key];
   return typeof v === "string" && v.trim() !== "" ? v.trim() : null;
 };
+
+/** 只取 host：写成 https://friend.test/ 或 friend.test 都行 */
+function hostOf(entry: string): string | null {
+  try {
+    return new URL(entry.includes("://") ? entry : `https://${entry}`).host.toLowerCase();
+  } catch {
+    return null;
+  }
+}
 
 const int = (env: Env, key: string, fallback: number): number => {
   const v = str(env, key);
@@ -48,9 +59,17 @@ export function loadConfig(env: Env): Config {
     mediaBase: (str(env, "MEDIA_BASE") ?? "/m").replace(/\/+$/, ""),
     mediaReferers: (str(env, "MEDIA_ALLOWED_REFERERS") ?? "")
       .split(",")
-      .map((h) => h.trim().toLowerCase())
-      .filter(Boolean),
+      .map((h) => h.trim())
+      .filter(Boolean)
+      .map(hostOf)
+      .filter((h): h is string => !!h),
     maxDownloadBytes: int(env, "MAX_DOWNLOAD_BYTES", 20 * 1024 * 1024),
+    image: {
+      optimize: !["0", "false"].includes(str(env, "IMAGE_OPTIMIZE") ?? ""),
+      quality: int(env, "IMAGE_QUALITY", 80),
+      maxSide: int(env, "IMAGE_MAX_SIDE", 2560),
+      maxBytes: int(env, "IMAGE_MAX_BYTES", 2 * 1024 * 1024),
+    },
     telegramApiBase: (str(env, "TELEGRAM_API_BASE") ?? "https://api.telegram.org").replace(/\/+$/, ""),
     pageSize: int(env, "PAGE_SIZE", 20),
   };

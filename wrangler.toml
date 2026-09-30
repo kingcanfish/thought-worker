@@ -9,15 +9,18 @@ directory = "./dist/site"
 binding = "ASSETS"
 not_found_handling = "404-page"
 
-# 图片视频：以后可以整体公开（绑定 R2 自定义域名直出）
+# 图片视频。不要开公开访问（r2.dev / 自定义域名直出）：只经 Worker 的 /m 读取，
+# 读取次数就被 Workers 免费版每天 10 万次请求封顶，不会超出 R2 免费额度
 [[r2_buckets]]
 binding = "MEDIA"
 bucket_name = "thought-worker-media"
 
-# 收件箱和数据库文件：永远不能公开，和媒体分开放
-[[r2_buckets]]
-binding = "DATA"
-bucket_name = "thought-worker-data"
+# 帖子、收件箱、构建锁。迁移：npx wrangler d1 migrations apply thought-worker --remote
+[[d1_databases]]
+binding = "DB"
+database_name = "thought-worker"
+database_id = ""
+migrations_dir = "migrations"
 
 [vars]
 # 和 site.env 里的 CHANNEL_ID 保持一致；配了它和 BOT_TOKEN，/del 会立即删除频道里的消息，不等构建

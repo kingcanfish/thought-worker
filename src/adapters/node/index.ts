@@ -4,11 +4,13 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import type { Config } from "../../core/config";
 import { createReceiverApp } from "../../core/http/app";
-import type { Stores } from "../../core/ports";
+import type { BlobStore, Database } from "../../core/ports";
 
 export interface ServerOptions {
   config: Config;
-  stores: Stores;
+  /** 收件箱写在这里；和构建端用同一个 SQLite 文件 */
+  db: Database;
+  media: BlobStore;
   fetch?: typeof fetch;
   /** 构建输出目录（静态站点） */
   siteDir: string;
@@ -17,7 +19,7 @@ export interface ServerOptions {
 /** 自建服务器：接收 webhook + 提供构建好的静态站点 + 媒体 */
 export function createNodeServer(opts: ServerOptions) {
   const app = new Hono();
-  const receiver = createReceiverApp(() => ({ config: opts.config, stores: opts.stores, fetch: opts.fetch ?? fetch }));
+  const receiver = createReceiverApp(() => ({ config: opts.config, db: opts.db, media: opts.media, fetch: opts.fetch ?? fetch }));
   app.route("/", receiver);
   app.use(
     "*",

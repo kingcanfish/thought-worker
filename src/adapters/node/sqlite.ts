@@ -52,15 +52,19 @@ export function migrate(db: SqliteDatabase, dir: string): string[] {
     name TEXT UNIQUE,
     applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`);
-  const applied = new Set((db.raw.prepare("SELECT name FROM d1_migrations").all() as { name: string }[]).map((r) => r.name));
-  const pending = readdirSync(dir)
-    .filter((f) => f.endsWith(".sql") && !applied.has(f))
+  const files = readdirSync(dir)
+    .filter((f) => f.endsWith(".sql"))
     .sort();
-  for (const name of pending) {
-    db.raw.exec("BEGIN");
+  const pending: string[] = [];
+  for (const name of files) {
+    // 接收端和构建端可能同时打开数据库：IMMEDIATE 先拿写锁，再在事务里判断是否已执行，不会重复执行
+    db.raw.exec("BEGIN IMMEDIATE");
     try {
-      db.raw.exec(readFileSync(join(dir, name), "utf8"));
-      db.raw.prepare("INSERT INTO d1_migrations (name) VALUES (?)").run(name);
+      if (!db.raw.prepare("SELECT 1 FROM d1_migrations WHERE name = ?").get(name)) {
+        db.raw.exec(readFileSync(join(dir, name), "utf8"));
+        db.raw.prepare("INSERT INTO d1_migrations (name) VALUES (?)").run(name);
+        pending.push(name);
+      }
       db.raw.exec("COMMIT");
     } catch (e) {
       db.raw.exec("ROLLBACK");

@@ -61,7 +61,7 @@ async function storeFile(deps: Deps, tg: TelegramClient, ref: FileRef, prefix: s
   const key = `${prefix}/${ref.fileUniqueId}${ext ? `.${ext}` : ""}`;
   const contentType = mime ?? mimeForKey(key);
   const res = await tg.download(file.file_path);
-  if (deps.optimizeImage && contentType.startsWith("image/")) {
+  if (deps.optimizeImage && OPTIMIZABLE_IMAGES.has(contentType)) {
     // 图片要整个读进来才能压缩（不超过下载上限 20MB）
     const bytes = new Uint8Array(await res.arrayBuffer());
     const out = await optimize(deps, bytes, contentType);
@@ -73,6 +73,9 @@ async function storeFile(deps: Deps, tg: TelegramClient, ref: FileRef, prefix: s
   await deps.blobs.put(key, res.body!, { contentType, size });
   return { status: "ready", key, mime: contentType, size: size ?? null };
 }
+
+/** 可以压缩的格式；其余（GIF 可能是动图）不读进内存，直接流式转存 */
+export const OPTIMIZABLE_IMAGES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 /** 压缩失败或没有变小就用原图：压缩只是优化，不能让转存失败 */
 export async function optimize(deps: Deps, bytes: Uint8Array, mime: string): Promise<{ bytes: Uint8Array; mime: string }> {

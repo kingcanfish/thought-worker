@@ -4,7 +4,7 @@ import type { Config } from "../../config";
 import { RangeNotSatisfiableError, type BlobObject, type ByteRange } from "../../ports";
 import type { AppEnv } from "../app";
 
-// 只放行媒体目录（收件箱和数据库在另一个存储里，这里再多挡一层）
+// 只放行媒体目录（媒体存储里本来也只有这些，这里再多挡一层）
 const KEY_RE = /^(photo|video|gif|thumb|link)\/[\w.-]+$/;
 const IMMUTABLE = "public, max-age=31536000, immutable";
 
@@ -21,12 +21,16 @@ export function parseRange(header: string | undefined): ByteRange | "invalid" | 
 }
 
 /**
- * 防盗链：没有 Referer（直接打开、RSS 阅读器、抓取分享卡片的爬虫）放行；
- * 有 Referer 时只放行本站、SITE_URL 和 MEDIA_ALLOWED_REFERERS 里的站点。
- * 挡的是别的网页直接引用；对方用 referrerpolicy="no-referrer" 仍然能绕过，所以只是减少，不是杜绝。
+ * 防盗链，挡的是别的网页把图片直接嵌进去：
+ * - 没有 Referer 放行：直接打开、桌面 RSS 阅读器、抓取分享卡片的爬虫；
+ * - 页面跳转（Sec-Fetch-Dest: document）放行：别的网站上指向图片的普通链接，点开能看；
+ * - 其余只放行本站、SITE_URL 和 MEDIA_ALLOWED_REFERERS。网页版 RSS 阅读器直接嵌图时带的是阅读器的域名，
+ *   需要的话把它加进 MEDIA_ALLOWED_REFERERS。
+ * 对方用 referrerpolicy="no-referrer" 仍然能绕过，所以只是减少，不是杜绝。
  */
-export function isHotlink(referer: string | undefined, requestUrl: string, config: Config): boolean {
-  if (!referer) return false;
+export function isHotlink(headers: { referer?: string; fetchDest?: string }, requestUrl: string, config: Config): boolean {
+  const { referer } = headers;
+  if (!referer || headers.fetchDest === "document") return false;
   let host: string;
   try {
     host = new URL(referer).host.toLowerCase();
@@ -46,8 +50,8 @@ export const mediaRoutes = new Hono<AppEnv>().on(["GET", "HEAD"], "/*", async (c
     return c.notFound(); // 非法的百分号编码
   }
   if (!KEY_RE.test(key) || key.includes("..")) return c.notFound();
-  const { config, stores, mediaCache } = c.var.deps;
-  if (isHotlink(c.req.header("referer"), c.req.url, config)) return c.body(null, 403, { "Cache-Control": "no-store" });
+  const { config, media, mediaCache } = c.var.deps;
+  if (isHotlink({ referer: c.req.header("referer"), fetchDest: c.req.header("sec-fetch-dest") }, c.req.url, config)) return c.body(null, 403, { "Cache-Control": "no-store" });
 
   // 缓存键只用路径：带随机查询参数也命中同一份，没法用来绕过缓存反复读存储
   const cacheKey = new URL(`/m/${key}`, c.req.url).href;
@@ -59,7 +63,7 @@ export const mediaRoutes = new Hono<AppEnv>().on(["GET", "HEAD"], "/*", async (c
   if (range === "invalid") return c.body(null, 416);
   let obj: BlobObject | null;
   try {
-    obj = await stores.media.get(key, range);
+    obj = await media.get(key, range);
   } catch (e) {
     if (!(e instanceof RangeNotSatisfiableError)) throw e;
     return c.body(null, 416, { "Content-Range": `bytes */${e.size}` });
