@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 import { SqliteDatabase, migrate } from "../adapters/node/sqlite";
 import type { Config } from "../core/config";
 import { renderSite } from "../core/build/site";
-import type { BlobStore, Deps, Stores } from "../core/ports";
+import type { BlobStore, Deps, ImageOptimizer, Stores } from "../core/ports";
 import { listInbox, readUpdate } from "../core/services/inbox";
 import { handleUpdate, telegramClient } from "../core/services/ingest";
 import { refreshLinkPreview } from "../core/services/link-preview";
@@ -30,6 +30,8 @@ export interface BuildOptions {
   config: Config;
   stores: Stores;
   fetch?: typeof fetch;
+  /** 转存图片前压缩；不传就原样存 */
+  optimizeImage?: ImageOptimizer;
   /** 静态站点输出目录（整体替换） */
   outDir: string;
   publicDir: string;
@@ -114,7 +116,7 @@ export async function runBuild(opts: BuildOptions): Promise<BuildResult> {
     try {
       const applied = migrate(db, opts.migrationsDir);
       if (applied.length) log(`执行迁移：${applied.join(", ")}`);
-      const deps: Deps = { config: opts.config, db, blobs: media, fetch: opts.fetch ?? fetch };
+      const deps: Deps = { config: opts.config, db, blobs: media, fetch: opts.fetch ?? fetch, optimizeImage: opts.optimizeImage };
 
       // 先重试之前失败的媒体，再处理新消息：这次刚失败的不会在同一次构建里被重复下载
       const retry = await retryFailedMedia(deps, telegramClient(deps));

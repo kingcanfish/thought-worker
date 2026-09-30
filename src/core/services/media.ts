@@ -61,9 +61,28 @@ async function storeFile(deps: Deps, tg: TelegramClient, ref: FileRef, prefix: s
   const key = `${prefix}/${ref.fileUniqueId}${ext ? `.${ext}` : ""}`;
   const contentType = mime ?? mimeForKey(key);
   const res = await tg.download(file.file_path);
+  if (deps.optimizeImage && contentType.startsWith("image/")) {
+    // 图片要整个读进来才能压缩（不超过下载上限 20MB）
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const out = await optimize(deps, bytes, contentType);
+    const outKey = out.mime === contentType ? key : `${prefix}/${ref.fileUniqueId}.${EXT_BY_MIME[out.mime]}`;
+    await deps.blobs.put(outKey, out.bytes, { contentType: out.mime, size: out.bytes.byteLength });
+    return { status: "ready", key: outKey, mime: out.mime, size: out.bytes.byteLength };
+  }
   const size = Number(res.headers.get("content-length")) || file.file_size || undefined;
   await deps.blobs.put(key, res.body!, { contentType, size });
   return { status: "ready", key, mime: contentType, size: size ?? null };
+}
+
+/** 压缩失败或没有变小就用原图：压缩只是优化，不能让转存失败 */
+export async function optimize(deps: Deps, bytes: Uint8Array, mime: string): Promise<{ bytes: Uint8Array; mime: string }> {
+  try {
+    const out = await deps.optimizeImage?.(bytes, mime);
+    if (out && out.bytes.byteLength < bytes.byteLength && EXT_BY_MIME[out.mime]) return out;
+  } catch (e) {
+    console.warn("image optimize failed, keeping original", e);
+  }
+  return { bytes, mime };
 }
 
 export async function transferMedia(deps: Deps, tg: TelegramClient, ref: MediaRef): Promise<TransferResult> {

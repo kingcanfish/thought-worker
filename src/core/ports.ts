@@ -71,6 +71,11 @@ export interface Stores {
   data: BlobStore;
 }
 
+/**
+ * 图片压缩（构建端可选）：返回压缩后的内容；不支持的格式、或压缩后没有变小时返回 null，保留原图。
+ */
+export type ImageOptimizer = (bytes: Uint8Array, mime: string) => Promise<{ bytes: Uint8Array; mime: string } | null>;
+
 /** 构建端依赖 */
 export interface Deps {
   config: Config;
@@ -78,6 +83,15 @@ export interface Deps {
   /** 媒体存储 */
   blobs: BlobStore;
   fetch: typeof fetch;
+  optimizeImage?: ImageOptimizer;
+}
+
+/** 边缘缓存（如 Workers Cache API）：命中就不再读媒体存储 */
+export interface MediaCache {
+  /** 用原始请求匹配（带上 Range / If-None-Match，由缓存自己处理） */
+  match(key: string, req: Request): Promise<Response | undefined>;
+  /** 后台写入，不阻塞响应 */
+  put(key: string, res: Response): void;
 }
 
 /** 接收端依赖 */
@@ -85,4 +99,5 @@ export interface ReceiverDeps {
   config: Config;
   stores: Stores;
   fetch: typeof fetch;
+  mediaCache?: MediaCache;
 }

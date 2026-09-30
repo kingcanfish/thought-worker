@@ -6,6 +6,7 @@ import { guardedFetch } from "../lib/url-guard";
 import type { Deps } from "../ports";
 import { firstLink } from "../telegram/entities";
 import type { LinkPreviewPrefs } from "../telegram/normalize";
+import { optimize } from "./media";
 import type { TgEntity } from "../telegram/types";
 import { fetchLinkMeta, readLimited } from "./link-meta";
 
@@ -26,9 +27,10 @@ async function storeImage(deps: Deps, url: string) {
     const bytes = await readLimited(res.body, MAX_IMAGE_BYTES, false);
     const info = bytes && imageSize(bytes);
     if (!bytes || !info) return null;
-    const key = `link/${(await sha256Hex(url)).slice(0, 32)}.${EXT[info.mime] ?? "img"}`;
-    await deps.blobs.put(key, bytes, { contentType: info.mime, size: bytes.byteLength });
-    return { key, ...info };
+    const out = await optimize(deps, bytes, info.mime);
+    const key = `link/${(await sha256Hex(url)).slice(0, 32)}.${EXT[out.mime] ?? "img"}`;
+    await deps.blobs.put(key, out.bytes, { contentType: out.mime, size: out.bytes.byteLength });
+    return { key, ...info, mime: out.mime };
   } catch (e) {
     console.warn("link preview image failed", url, e);
     return null;

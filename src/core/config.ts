@@ -13,6 +13,8 @@ export interface Config {
   siteTz: string;
   /** 媒体地址前缀：/m（经应用转发）或 https://media.example.com（对象存储直出） */
   mediaBase: string;
+  /** 除本站外，还允许哪些站点（host）引用 /m 的媒体；没有 Referer 的请求总是放行 */
+  mediaReferers: string[];
   maxDownloadBytes: number;
   telegramApiBase: string;
   pageSize: number;
@@ -44,6 +46,10 @@ export function loadConfig(env: Env): Config {
     siteUrl: str(env, "SITE_URL")?.replace(/\/+$/, "") ?? null,
     siteTz: str(env, "SITE_TZ") ?? "Asia/Shanghai",
     mediaBase: (str(env, "MEDIA_BASE") ?? "/m").replace(/\/+$/, ""),
+    mediaReferers: (str(env, "MEDIA_ALLOWED_REFERERS") ?? "")
+      .split(",")
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean),
     maxDownloadBytes: int(env, "MAX_DOWNLOAD_BYTES", 20 * 1024 * 1024),
     telegramApiBase: (str(env, "TELEGRAM_API_BASE") ?? "https://api.telegram.org").replace(/\/+$/, ""),
     pageSize: int(env, "PAGE_SIZE", 20),
