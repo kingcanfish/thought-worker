@@ -100,6 +100,8 @@
 - **静态文件**：直接由 Cloudflare 边缘节点返回，不执行代码、不查数据库。
 - **按需加载**：首屏帖子直接写在 HTML 里；筛选 / 翻页用的索引（`data/index.json`）和按月分块的帖子 HTML 按需加载。
 - **图片按尺寸取**：Telegram 会给每张图生成多个尺寸，转存时同时存中等尺寸（约 720px 以上的一档）做缩略图，时间线用缩略图，灯箱再加载原图。
+- **转存时压缩**：构建端用 sharp 把图片（照片、缩略图、链接卡片配图）转成 WebP（质量 80，最长边 2560，单张不超过 2MB：超过就先降质量到 50，再按 0.8 倍缩尺寸，最小 640），按 EXIF 方向转正并去掉 EXIF（包括「以文件发送」原图里的 GPS）；GIF 不处理，压缩失败或没变小就保留原图。接收端不做：webhook 只存原始消息，Workers 免费版每次只有 10ms CPU。
+- **边缘缓存**：`/m/*` 用 Workers Cache API 把完整文件缓存在当前节点，命中后不再读 R2，也省掉一次跨地区回源；`Range` 和 `If-None-Match` 由缓存直接应答（206 / 304）。缓存键只取路径，带随机查询参数也绕不过去。⚠️ Cache API 在 `*.workers.dev` 上不生效，要绑自定义域名；缓存省的是 R2 读取和延迟，Worker 请求数照算。
 - ⚠️ **中国大陆**：`*.workers.dev`（以及 `*.r2.dev`）在大陆基本无法直接访问；绑定自定义域名后可以访问，但 Cloudflare 免费版在大陆没有节点，延迟约 150~300ms+。真正的大陆加速需要 ICP 备案 + 国内 CDN，不在免费范围内。**所以域名迁入 Cloudflare 的优先级要提前。**
 
 ### 2.3 构建时机：每天一次，有新内容才构建
@@ -255,9 +257,11 @@ channel_post: text 以 bot_command "/del" 开头 且 带 reply_to_message
 
 | 阶段 | `MEDIA_BASE` | 说明 |
 | --- | --- | --- |
-| 现在（默认） | `/m` | Worker 从媒体桶读取并返回，`Cache-Control: public, max-age=31536000, immutable`；支持 `Range`（超出末尾的区间截断，越界返回 416），视频可拖动进度条；只放行 `photo/ video/ gif/ thumb/ link/` |
+| 现在（默认） | `/m` | Worker 先查边缘缓存，未命中再从媒体桶读取，`Cache-Control: public, max-age=31536000, immutable`；支持 `Range`（超出末尾的区间截断，越界返回 416），视频可拖动进度条；只放行 `photo/ video/ gif/ thumb/ link/`；防盗链见下 |
 | 备选 | `https://pub-xxx.r2.dev` | R2 公开地址，不占 Worker 请求；但官方限速、不建议生产使用、无 CDN 缓存 |
 | 域名迁入后（最终） | `https://media.<域名>` | R2 绑定自定义域名直出，走 Cloudflare CDN 缓存，不占 Worker 请求 |
+
+- **防盗链**（`/m/*`）：没有 `Referer` 的请求放行（直接打开、RSS 阅读器、抓分享卡片的爬虫）；有 `Referer` 时只放行本站、`SITE_URL` 和 `MEDIA_ALLOWED_REFERERS`，其余返回 403（`no-store`，不进缓存）。先校验再查缓存。对方用 `referrerpolicy="no-referrer"` 仍能绕过，所以只是减少盗链，R2 读取量的硬上限仍然是 Workers 免费版每天 10 万次请求。
 
 **域名计划**：现有域名不在 Cloudflare，分两步走：
 
@@ -337,7 +341,7 @@ Telegram 只告诉 Bot 预览的开关和偏好（`link_preview_options`），**
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/tg/webhook` | Telegram 回调，存进收件箱 |
-| GET | `/m/<photo|video|gif|thumb|link>/<key>` | 媒体（`MEDIA_BASE=/m` 时），支持 `Range` / `416` / `ETag` |
+| GET | `/m/<photo|video|gif|thumb|link>/<key>` | 媒体（`MEDIA_BASE=/m` 时），支持 `Range` / `416` / `ETag`；边缘缓存；外站 `Referer` 返回 403 |
 
 其余都是构建生成的静态文件：
 

@@ -128,6 +128,7 @@ npm run dev               # 或用 wrangler dev 在 Workers 运行时里跑（�
 | `SITE_URL` | 站点地址，RSS 和分享卡片要用 | — |
 | `SITE_TZ` | 按天分组、日期筛选用的时区 | Asia/Shanghai |
 | `MEDIA_BASE` | 媒体地址前缀：`/m`（Worker 转发）或对象存储直出域名 | /m |
+| `MEDIA_ALLOWED_REFERERS` | 防盗链：除本站和 `SITE_URL` 外，还允许引用 `/m` 媒体的站点，逗号分隔的 host（没有 Referer 的请求总是放行） | — |
 | `PAGE_SIZE` | 每次加载的条数 | 20 |
 | `STORAGE` | `fs`（本地磁盘）/ `r2` / `s3` | fs |
 | `DATA_DIR` | `STORAGE=fs` 时的数据目录（`media/` + `private/`） | ./data |
@@ -138,6 +139,9 @@ npm run dev               # 或用 wrangler dev 在 Workers 运行时里跑（�
 | `FORCE` | 没有新消息也构建 | — |
 | `DEPLOY_COMMAND` | 渲染后执行的部署命令，成功后才回写数据 | — |
 | `MAX_DOWNLOAD_BYTES` | 超过的文件只存封面 | 20MB |
+| `IMAGE_OPTIMIZE` | 设为 `0` 时不压缩，图片原样转存 | 压缩 |
+| `IMAGE_QUALITY` / `IMAGE_MAX_SIDE` | 转存图片时转成 WebP 的质量 / 最长边（没变小就保留原图） | 80 / 2560 |
+| `IMAGE_MAX_BYTES` | 压缩后单张图片的大小上限：超过就先降质量（最低 50），再缩尺寸（最小 640） | 2MB |
 | `TELEGRAM_API_BASE` | Bot API 地址 | https://api.telegram.org |
 | `PORT` / `HOST` | 自建服务器监听地址 | 8787 / 0.0.0.0 |
 
