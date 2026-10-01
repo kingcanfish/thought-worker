@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { D1HttpDatabase } from "../adapters/d1/http";
 import { FsBlobStore } from "../adapters/node/fs-store";
 import { SqliteDatabase, migrate } from "../adapters/node/sqlite";
@@ -63,7 +64,10 @@ export function databaseFromEnv(env: Env, migrationsDir: string): OpenedDatabase
     return { db, close: () => {} };
   }
   if (kind !== "sqlite") throw new Error(`unknown DB=${kind}`);
-  const db = new SqliteDatabase(opt(env, "DB_PATH") ?? resolve(dataDir(env), "thought.db"));
+  const path = opt(env, "DB_PATH") ?? resolve(dataDir(env), "thought.db");
+  // SQLite 不会自己建上级目录：新机器上第一次运行时 DATA_DIR 还不存在
+  mkdirSync(dirname(path), { recursive: true });
+  const db = new SqliteDatabase(path);
   migrate(db, migrationsDir);
   return { db, close: () => db.close() };
 }

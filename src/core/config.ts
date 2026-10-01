@@ -5,7 +5,10 @@ export interface Config {
   /** 公开频道的用户名（不带 @），用于生成 t.me 回链 */
   channelUsername: string | null;
   siteTitle: string;
+  /** 一行的简介：meta 描述、RSS 用 */
   siteDescription: string;
+  /** 侧栏简介，按行拆开（SITE_DESCRIPTION 里用双引号包住、写 \n 换行） */
+  siteBio: string[];
   /** 头像：图片 URL，或用作文字头像的一个字 */
   siteAvatar: string;
   /** 站点对外地址（RSS / OG 用），不填就用请求的 origin */
@@ -46,13 +49,18 @@ const int = (env: Env, key: string, fallback: number): number => {
 
 export function loadConfig(env: Env): Config {
   const channelId = str(env, "CHANNEL_ID");
+  const bio = (str(env, "SITE_DESCRIPTION") ?? "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
   return {
     botToken: str(env, "BOT_TOKEN") ?? "",
     webhookSecret: str(env, "WEBHOOK_SECRET") ?? "",
     channelId: channelId === null ? null : Number(channelId),
     channelUsername: str(env, "CHANNEL_USERNAME")?.replace(/^@/, "") ?? null,
     siteTitle: str(env, "SITE_TITLE") ?? "碎碎念",
-    siteDescription: str(env, "SITE_DESCRIPTION") ?? "",
+    siteDescription: bio.join(""),
+    siteBio: bio,
     siteAvatar: str(env, "SITE_AVATAR") ?? "念",
     siteUrl: str(env, "SITE_URL")?.replace(/\/+$/, "") ?? null,
     siteTz: str(env, "SITE_TZ") ?? "Asia/Shanghai",

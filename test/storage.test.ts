@@ -1,4 +1,7 @@
 // 环境变量 → 数据库 / 媒体存储：空字符串当作没设置
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { D1HttpDatabase } from "../src/adapters/d1/http";
 import { S3BlobStore } from "../src/adapters/s3/s3-store";
@@ -23,6 +26,19 @@ describe("storage from env", () => {
       globalThis.fetch = realFetch;
     }
     expect(urls).toEqual(["https://acc.r2.cloudflarestorage.com/thought-worker-media/photo/x.jpg"]);
+  });
+
+  it("creates DATA_DIR on first run and applies migrations", async () => {
+    const root = mkdtempSync(join(tmpdir(), "thought-storage-"));
+    try {
+      const dir = join(root, "not", "yet");
+      const opened = databaseFromEnv({ DATA_DIR: dir }, resolve("migrations"));
+      expect(existsSync(join(dir, "thought.db"))).toBe(true);
+      expect(await opened.db.first("SELECT publish_pending FROM site_state")).toEqual({ publish_pending: 0 });
+      opened.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("treats empty credentials as missing instead of sending them", () => {

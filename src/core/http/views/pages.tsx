@@ -48,7 +48,16 @@ function Sidebar(props: HomeData) {
       <h1 class="name">
         <a href="/">{config.siteTitle}</a>
       </h1>
-      {config.siteDescription && <p class="bio">{config.siteDescription}</p>}
+      {config.siteBio.length > 0 && (
+        <p class="bio">
+          {config.siteBio.map((line, i) => (
+            <>
+              {i > 0 && <br />}
+              {line}
+            </>
+          ))}
+        </p>
+      )}
       <div class="stats">
         <div class="stat">
           <b>{stats.posts}</b>
