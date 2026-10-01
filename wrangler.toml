@@ -4,6 +4,9 @@ name = "thought-worker"
 main = "src/adapters/cloudflare/index.ts"
 compatibility_date = "2026-09-01"
 
+# 自定义域名：部署时自动建 DNS 记录和证书（域名需托管在 Cloudflare）。媒体的边缘缓存只在自定义域名上生效
+routes = [{ pattern = "memos.gxy.plus", custom_domain = true }]
+
 [assets]
 directory = "./dist/site"
 binding = "ASSETS"
@@ -19,12 +22,12 @@ bucket_name = "thought-worker-media"
 [[d1_databases]]
 binding = "DB"
 database_name = "thought-worker"
-database_id = ""
+database_id = "acdb3d6e-dd3f-4748-9bab-9e6b6bf10ec1"
 migrations_dir = "migrations"
 
 [vars]
 # 和 site.env 里的 CHANNEL_ID 保持一致；配了它和 BOT_TOKEN，/del 会立即删除频道里的消息，不等构建
-CHANNEL_ID = ""
+CHANNEL_ID = "-1003912012983"
 # 防盗链：除本站和 SITE_URL 外，还允许引用 /m 媒体的站点（逗号分隔的 host）
 MEDIA_ALLOWED_REFERERS = ""
 
