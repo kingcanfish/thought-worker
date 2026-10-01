@@ -56,6 +56,8 @@ export class D1HttpDatabase implements Database {
     return data.result;
   }
 
+  // 注意：HTTP API 把 JSON 数字按 REAL 绑定（binding 和 node:sqlite 是 INTEGER）。表里的数字列都是 INTEGER 亲和性，
+  // 写入时自动转回整数、比较按数值，已在真实 D1 上验证；新增查询时不要依赖 typeof(?) 或整数除法
   async all<T>(sql: string, params: SqlValue[] = []): Promise<T[]> {
     const [r] = await this.query({ sql, params });
     return (r?.results ?? []) as T[];
