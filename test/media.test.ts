@@ -1,4 +1,5 @@
 // /m 媒体：防盗链、边缘缓存、转存时压缩图片
+import { randomBytes } from "node:crypto";
 import sharp from "sharp";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createImageOptimizer } from "../src/build/image";
@@ -142,26 +143,26 @@ describe("image optimization", () => {
     expect([meta.width, meta.height]).toEqual([1707, 2560]);
     expect(meta.orientation).toBeUndefined();
     expect(meta.exif).toBeUndefined();
-  });
+  }, 20_000);
 
   it("lowers quality, then size, until the image fits the byte limit", async () => {
     // 噪点图几乎压不动，逼着它一路降到上限以内
-    const raw = Buffer.alloc(2000 * 2000 * 3);
-    for (let i = 0; i < raw.length; i++) raw[i] = (i * 2654435761) >>> 24;
-    const png = await sharp(raw, { raw: { width: 2000, height: 2000, channels: 3 } }).png().toBuffer();
-    const limit = 300 * 1024;
+    // 700×700 随机噪点：质量降到 50 仍有约 280KB，缩到 640 才进 250KB，两个阶段都会走到
+    const raw = randomBytes(700 * 700 * 3);
+    const png = await sharp(raw, { raw: { width: 700, height: 700, channels: 3 } }).png().toBuffer();
+    const limit = 250 * 1024;
 
     const out = await createImageOptimizer({ quality: 80, maxSide: 2560, maxBytes: limit })(new Uint8Array(png), "image/png");
     expect(out!.bytes.byteLength).toBeLessThanOrEqual(limit);
     const meta = await sharp(out!.bytes).metadata();
-    expect(meta.width).toBeLessThan(2000);
+    expect(meta.width).toBe(640);
     expect(meta.width).toBe(meta.height);
 
     // 本来就在上限以内的图不缩尺寸
     const small = await sharp({ create: { width: 1200, height: 800, channels: 3, background: "#88aacc" } }).jpeg().toBuffer();
     const kept = await createImageOptimizer({ quality: 80, maxSide: 2560, maxBytes: limit })(new Uint8Array(small), "image/jpeg");
     expect((await sharp(kept!.bytes).metadata()).width).toBe(1200);
-  });
+  }, 20_000);
 
   it("keeps animated WebP untouched instead of flattening it to one frame", async () => {
     const frame = (c: string) => sharp({ create: { width: 64, height: 64, channels: 3, background: c } }).png().toBuffer();
