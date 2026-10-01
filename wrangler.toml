@@ -1,5 +1,5 @@
-# 接收端 + 静态站点。页面由 [assets] 直接提供（不计 Worker 请求）；
-# 只有 /tg/webhook 和 /m/*（媒体）会执行 Worker。站点由 `npm run build:site` 生成到 dist/site。
+# 接收端 + 静态站点。页面和图片由 [assets] 直接提供（不计 Worker 请求，构建时 STATIC_MEDIA=1 把图片拷进 dist/site/m）；
+# 只有 /tg/webhook 和 /m/* 里的视频会执行 Worker。站点由 `npm run build:site` 生成到 dist/site。
 name = "thought-worker"
 main = "src/adapters/cloudflare/index.ts"
 compatibility_date = "2026-09-01"
@@ -12,8 +12,8 @@ directory = "./dist/site"
 binding = "ASSETS"
 not_found_handling = "404-page"
 
-# 图片视频。不要开公开访问（r2.dev / 自定义域名直出）：只经 Worker 的 /m 读取，
-# 读取次数就被 Workers 免费版每天 10 万次请求封顶，不会超出 R2 免费额度
+# 图片视频。不要开公开访问（r2.dev / 自定义域名直出）：访客只经 Worker 的 /m 读取（视频），
+# 读取次数就被 Workers 免费版每天 10 万次请求封顶，不会超出 R2 免费额度；图片由构建端读出后作为静态资源部署
 [[r2_buckets]]
 binding = "MEDIA"
 bucket_name = "thought-worker-media"

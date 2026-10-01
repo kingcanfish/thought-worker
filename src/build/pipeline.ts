@@ -13,6 +13,7 @@ import { handleUpdate, telegramClient } from "../core/services/ingest";
 import { refreshLinkPreview } from "../core/services/link-preview";
 import { retryFailedMedia } from "../core/services/media";
 import type { LinkPreviewPrefs } from "../core/telegram/normalize";
+import { copyImages, type StaticMediaOptions } from "./static-media";
 
 /** 超过这个时间的锁视为上次构建异常退出留下的，可以接管 */
 const LOCK_TTL_MS = 60 * 60 * 1000;
@@ -35,6 +36,8 @@ export interface BuildOptions {
   /** 静态站点输出目录（整体替换） */
   outDir: string;
   publicDir: string;
+  /** 把图片拷进输出目录的 m/ 下（Cloudflare 上由静态资源直接提供，不经 Worker）；不传就都经 /m 路由 */
+  staticMedia?: StaticMediaOptions;
   /** 没有新消息也重新构建（改了模板 / 首次部署） */
   force?: boolean;
   /** 渲染完成后执行，失败则不清理收件箱 */
@@ -50,6 +53,8 @@ export interface BuildResult {
   retried: number;
   posts: number;
   files: number;
+  /** 拷进输出目录的图片数 */
+  images: number;
 }
 
 /**
@@ -112,10 +117,10 @@ export async function runBuild(opts: BuildOptions): Promise<BuildResult> {
     const siteChanged = inbox.length > 0 || pending;
     if (!siteChanged && !opts.force) {
       log("没有新内容，跳过构建");
-      return { changed: false, processed: 0, retried: 0, posts: 0, files: 0 };
+      return { changed: false, processed: 0, retried: 0, posts: 0, files: 0, images: 0 };
     }
     const site = await render(deps, opts);
-    log(`渲染完成：${site.posts} 条帖子，${site.files} 个文件`);
+    log(`渲染完成：${site.posts} 条帖子，${site.files} 个文件${opts.staticMedia ? `，${site.images} 张图片` : ""}`);
 
     // 部署前再核对一次：锁被接管了就不要用这份（可能更旧的）渲染结果覆盖对方的部署
     await assertLockHeld(db, token);
@@ -153,9 +158,15 @@ async function render(deps: Deps, opts: BuildOptions) {
     },
     { buildId: Date.now().toString(36), now: opts.now },
   );
+  let images = 0;
+  if (opts.staticMedia) {
+    const r = await copyImages(deps.db, deps.blobs, staging, opts.staticMedia);
+    if (r.missing.length) (opts.log ?? console.warn)(`媒体存储里缺少 ${r.missing.length} 张图片：${r.missing.slice(0, 5).join(", ")}`);
+    images = r.images;
+  }
   await rm(`${opts.outDir}.old`, { recursive: true, force: true });
   await rename(opts.outDir, `${opts.outDir}.old`).catch(() => {});
   await rename(staging, opts.outDir);
   await rm(`${opts.outDir}.old`, { recursive: true, force: true });
-  return site;
+  return { ...site, images };
 }

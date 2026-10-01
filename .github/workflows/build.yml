@@ -34,6 +34,13 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # 图片要拷进站点目录（STATIC_MEDIA）：缓存下来，每次构建只下载新图片。文件名不会变，缓存不会过期
+      - name: 图片缓存
+        uses: actions/cache@v4
+        with:
+          path: .cache/media
+          key: media-${{ github.run_id }}
+          restore-keys: media-
       - name: 读取 D1 数据库 ID
         run: echo "D1_DATABASE_ID=$(sed -n 's/^database_id *= *"\(.*\)"/\1/p' wrangler.toml)" >> "$GITHUB_ENV"
       - name: 构建并部署
@@ -47,6 +54,8 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          STATIC_MEDIA: "1"
+          STATIC_MEDIA_CACHE: .cache/media
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           DEPLOY_COMMAND: npx wrangler deploy
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

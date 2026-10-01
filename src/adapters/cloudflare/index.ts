@@ -1,5 +1,5 @@
 // Cloudflare Workers 入口：静态文件由 [assets] 直接提供（不经过这里），
-// 没有匹配到静态文件的请求才进来：/tg/webhook、/m/*，其余交回静态资源处理成 404 页。
+// 没有匹配到静态文件的请求才进来：/tg/webhook、/m/*（视频；图片构建时已拷进静态资源），其余交回静态资源处理成 404 页。
 import type { Context } from "hono";
 import { loadConfig } from "../../core/config";
 import { createReceiverApp } from "../../core/http/app";

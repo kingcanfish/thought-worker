@@ -129,7 +129,7 @@ npm run dev               # 或用 wrangler dev 在 Workers 运行时里跑（�
 | `SITE_URL` | 站点地址，RSS 和分享卡片要用 | — |
 | `SITE_TZ` | 按天分组、日期筛选用的时区 | Asia/Shanghai |
 | `MEDIA_BASE` | 媒体地址前缀：`/m`（Worker 转发）或对象存储直出域名 | /m |
-| `MEDIA_ALLOWED_REFERERS` | 防盗链：除本站和 `SITE_URL` 外，还允许嵌入 `/m` 媒体的站点，逗号分隔（写 host 或完整地址都行；没有 Referer 的请求和页面跳转总是放行） | — |
+| `MEDIA_ALLOWED_REFERERS` | 防盗链（只对经 `/m` 路由的媒体生效，`STATIC_MEDIA=1` 时就只剩视频）：除本站和 `SITE_URL` 外，还允许嵌入 `/m` 媒体的站点，逗号分隔（写 host 或完整地址都行；没有 Referer 的请求和页面跳转总是放行） | — |
 | `PAGE_SIZE` | 每次加载的条数 | 20 |
 | `DB` | 数据库：`sqlite`（`DATA_DIR/thought.db`）/ `d1`（需要 `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_API_TOKEN`、`D1_DATABASE_ID`） | sqlite |
 | `STORAGE` | 媒体存储：`fs`（本地磁盘）/ `r2` / `s3` | fs |
@@ -139,6 +139,8 @@ npm run dev               # 或用 wrangler dev 在 Workers 运行时里跑（�
 | `S3_ENDPOINT` / `S3_BUCKET` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` | `STORAGE=s3`（MinIO / AWS S3 / Backblaze B2 …） | — |
 | `SITE_DIR` | 站点输出目录 | ./dist/site |
 | `FORCE` | 没有新消息也构建 | — |
+| `STATIC_MEDIA` | 设为 `1` 时构建把页面引用的图片拷进站点目录的 `m/`（地址不变），Cloudflare 上由静态资源直接提供、不经 Worker；视频仍走 `/m` 路由。自建服务器不需要 | — |
+| `STATIC_MEDIA_CACHE` | 图片的本地缓存目录，有就不再从媒体存储下载（CI 里配合 `actions/cache`） | — |
 | `DEPLOY_COMMAND` | 渲染后执行的部署命令，成功后才清理收件箱 | — |
 | `MAX_DOWNLOAD_BYTES` | 超过的文件只存封面 | 20MB |
 | `IMAGE_OPTIMIZE` | 设为 `0` 时不压缩，图片原样转存 | 压缩 |

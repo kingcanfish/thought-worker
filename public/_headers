@@ -3,3 +3,6 @@
   Cache-Control: public, max-age=3600
 /data/*
   Cache-Control: public, max-age=0, must-revalidate
+# 构建时拷进来的图片（STATIC_MEDIA=1）：文件名按内容来源固定，不会变
+/m/*
+  Cache-Control: public, max-age=31536000, immutable

@@ -142,6 +142,30 @@ describe("build", () => {
     expect(deletes()).toEqual([[cmdId, b.message_id], [cmdId], [a.message_id, b.message_id]]);
   });
 
+  it("copies referenced images into the site with STATIC_MEDIA, reusing the cache and skipping deleted posts", async () => {
+    const cacheDir = `${t.dir}/media-cache`;
+    const keep = message({ photo: photo("s1"), caption: "留着" });
+    const gone = message({ photo: photo("s2") });
+    await t.send(post(keep));
+    await t.send(post(gone));
+    await t.send(post(message({ text: "/del", entities: [{ type: "bot_command", offset: 0, length: 4 }], reply_to_message: gone })));
+    const r = await t.build({ staticMedia: { cacheDir } });
+    expect(r.images).toBe(2);
+    // 地址不变，还是 /m/<key>
+    expect(t.file("m/photo/s1-u.jpg")).toBe(t.file("m/thumb/s1-um.jpg"));
+    expect(t.postHtml(ids()[0]!)).toContain('src="/m/thumb/s1-um.jpg"');
+    expect(t.exists("m/photo/s2-u.jpg")).toBe(false);
+
+    // 下次构建从缓存拷，不再读媒体存储（存储里删掉了也照样有）
+    await t.media.delete("photo/s1-u.jpg");
+    await t.build({ force: true, staticMedia: { cacheDir } });
+    expect(t.exists("m/photo/s1-u.jpg")).toBe(true);
+
+    // 没开就不拷
+    await t.build({ force: true });
+    expect(t.exists("m")).toBe(false);
+  });
+
   it("labels oversized videos and photos correctly", async () => {
     await t.send(
       post(

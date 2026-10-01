@@ -2,6 +2,8 @@
 //   FORCE=1          没有新消息也构建
 //   DB / STORAGE     数据库和媒体存储，见 ./storage.ts
 //   DEPLOY_COMMAND   渲染后执行的部署命令（如 `npx wrangler deploy`）；自建服务器直接读输出目录，不需要
+//   STATIC_MEDIA=1   把图片拷进站点目录（由静态资源直接提供，不经 Worker）；视频仍走 /m
+//   STATIC_MEDIA_CACHE 图片的本地缓存目录，下次构建不必重新下载（CI 里配合 actions/cache）
 //   IMAGE_OPTIMIZE=0 不压缩图片，原样转存（默认转成 WebP）
 //   IMAGE_QUALITY    WebP 质量，默认 80
 //   IMAGE_MAX_SIDE   图片最长边，默认 2560
@@ -23,6 +25,7 @@ if (config.channelId === null) throw new Error("缺少 CHANNEL_ID");
 if (!config.siteUrl) console.warn("⚠️ 没有设置 SITE_URL：RSS 和分享卡片里的链接会是相对地址");
 
 const deployCommand = env.DEPLOY_COMMAND;
+const flag = (v: string | undefined) => !!v && v !== "0" && v !== "false";
 const optimizeImage = config.image.optimize ? createImageOptimizer(config.image) : undefined;
 const opened = databaseFromEnv(env, resolve("migrations"));
 try {
@@ -33,7 +36,8 @@ try {
     optimizeImage,
     outDir: resolve(env.SITE_DIR ?? "./dist/site"),
     publicDir: resolve("public"),
-    force: !!env.FORCE && env.FORCE !== "0" && env.FORCE !== "false",
+    force: flag(env.FORCE),
+    staticMedia: flag(env.STATIC_MEDIA) ? { cacheDir: env.STATIC_MEDIA_CACHE ? resolve(env.STATIC_MEDIA_CACHE) : undefined } : undefined,
     deploy: deployCommand
       ? () =>
           new Promise<void>((ok, fail) => {
