@@ -1,0 +1,16 @@
+# 构建端镜像（K8s CronJob 等定时任务）：迁移 D1 → 处理收件箱 → 渲染 → wrangler deploy，跑完就退出。
+# 和 Dockerfile（自建服务器）不同：wrangler deploy 要从源码打包 Worker，所以带上完整源码和 devDependencies。
+# 镜像由 .github/workflows/image.yml 推到 ghcr，K8s 清单见 deploy/k8s/
+FROM node:24-slim
+WORKDIR /app
+# CI=1：wrangler 不弹交互确认（迁移、首次部署）
+ENV CI=1 WRANGLER_SEND_METRICS=false \
+    DB=d1 STORAGE=r2 STATIC_MEDIA=1 STATIC_MEDIA_CACHE=/cache/media \
+    DEPLOY_COMMAND="npx wrangler deploy"
+# 不用 root 跑；wrangler 部署时要往 /app/.wrangler 写临时文件，图片缓存目录挂卷到 /cache/media
+RUN mkdir -p /cache/media && chown -R node:node /app /cache
+USER node
+COPY --chown=node:node package.json package-lock.json ./
+RUN npm ci && npm cache clean --force
+COPY --chown=node:node . .
+CMD ["sh", "scripts/cron-build.sh"]

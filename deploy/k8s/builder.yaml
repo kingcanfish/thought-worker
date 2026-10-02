@@ -1,0 +1,83 @@
+# 定时构建：每 3 小时拉取最新的构建端镜像，迁移 D1 → 处理收件箱 → 渲染 → wrangler deploy。
+# 和 GitHub Actions 的定时任务可以同时存在：构建锁在 D1 里，后跑的那个看到收件箱为空就跳过。
+#
+# 部署：
+#   kubectl apply -f deploy/k8s/builder.yaml
+#   kubectl -n thought-worker create secret generic thought-worker-build --from-env-file=build.env   # 见 build.env.example
+#   # ghcr 包是私有的话（公开的话删掉下面的 imagePullSecrets）：PAT 需要 read:packages 权限
+#   kubectl -n thought-worker create secret docker-registry ghcr \
+#     --docker-server=ghcr.io --docker-username=kingcanfish --docker-password=<PAT>
+# 手动跑一次：
+#   kubectl -n thought-worker create job --from=cronjob/thought-worker-build build-$(date +%s)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: thought-worker
+---
+# 图片缓存（STATIC_MEDIA_CACHE）：每次构建只下载新图片。丢了也没关系，下次构建从 R2 重新下载
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: thought-worker-media-cache
+  namespace: thought-worker
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: thought-worker-build
+  namespace: thought-worker
+spec:
+  # 北京时间 0、3、6…21 点；和 GitHub Actions 的 04:00 错开
+  schedule: "0 */3 * * *"
+  timeZone: Asia/Shanghai
+  # 上一次还没跑完就不再启动新的（D1 构建锁也会挡住，这里先在 K8s 层面避免）
+  concurrencyPolicy: Forbid
+  # 集群停机错过了时间点，一小时内恢复还会补跑
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 604800
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr
+          # 镜像里是 node 用户（uid 1000），让它能写缓存卷
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+          containers:
+            - name: build
+              image: ghcr.io/kingcanfish/thought-worker-builder:latest
+              imagePullPolicy: Always
+              envFrom:
+                - secretRef:
+                    name: thought-worker-build
+              # 没有新消息也强制构建：取消注释
+              # env:
+              #   - name: FORCE
+              #     value: "1"
+              volumeMounts:
+                - name: media-cache
+                  mountPath: /cache/media
+              # sharp 压缩大图时内存会到几百 MB
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 256Mi
+                limits:
+                  memory: 1Gi
+          volumes:
+            - name: media-cache
+              persistentVolumeClaim:
+                claimName: thought-worker-media-cache
