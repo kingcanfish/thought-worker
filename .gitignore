@@ -5,4 +5,4 @@ data/
 .wrangler/
 .dev.vars
 .env
-deploy/k8s/build.env
+deploy/k8s/publish.env

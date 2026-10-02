@@ -1,14 +1,14 @@
-# 定时构建：每 3 小时拉取最新的构建端镜像，迁移 D1 → 处理收件箱 → 渲染 → wrangler deploy。
+# 定时构建：每 2 小时拉取最新的构建端镜像，迁移 D1 → 处理收件箱 → 渲染 → wrangler deploy。
 # 和 GitHub Actions 的定时任务可以同时存在：构建锁在 D1 里，后跑的那个看到收件箱为空就跳过。
 #
 # 部署：
-#   kubectl apply -f deploy/k8s/builder.yaml
-#   kubectl -n thought-worker create secret generic thought-worker-build --from-env-file=build.env   # 见 build.env.example
+#   kubectl apply -f deploy/k8s/publisher.yaml
+#   kubectl -n thought-worker create secret generic thought-worker-publish --from-env-file=publish.env   # 见 publish.env.example
 #   # ghcr 包是私有的话（公开的话删掉下面的 imagePullSecrets）：PAT 需要 read:packages 权限
 #   kubectl -n thought-worker create secret docker-registry ghcr \
 #     --docker-server=ghcr.io --docker-username=kingcanfish --docker-password=<PAT>
 # 手动跑一次：
-#   kubectl -n thought-worker create job --from=cronjob/thought-worker-build build-$(date +%s)
+#   kubectl -n thought-worker create job --from=cronjob/thought-worker-publish publish-$(date +%s)
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -29,18 +29,19 @@ spec:
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: thought-worker-build
+  name: thought-worker-publish
   namespace: thought-worker
 spec:
-  # 北京时间 0、3、6…21 点；和 GitHub Actions 的 04:00 错开
-  schedule: "0 */3 * * *"
+  # 北京时间 0、2、4…22 点
+  schedule: "0 */2 * * *"
   timeZone: Asia/Shanghai
   # 上一次还没跑完就不再启动新的（D1 构建锁也会挡住，这里先在 K8s 层面避免）
   concurrencyPolicy: Forbid
   # 集群停机错过了时间点，一小时内恢复还会补跑
   startingDeadlineSeconds: 3600
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 3
+  # 成功、失败的运行记录（连同日志）各留最近 10 次供回查，更早的自动删除
+  successfulJobsHistoryLimit: 10
+  failedJobsHistoryLimit: 10
   jobTemplate:
     spec:
       backoffLimit: 1
@@ -57,12 +58,12 @@ spec:
             runAsGroup: 1000
             fsGroup: 1000
           containers:
-            - name: build
-              image: ghcr.io/kingcanfish/thought-worker-builder:latest
+            - name: publish
+              image: ghcr.io/kingcanfish/thought-worker-publisher:latest
               imagePullPolicy: Always
               envFrom:
                 - secretRef:
-                    name: thought-worker-build
+                    name: thought-worker-publish
               # 没有新消息也强制构建：取消注释
               # env:
               #   - name: FORCE

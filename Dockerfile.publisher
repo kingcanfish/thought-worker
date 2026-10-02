@@ -13,4 +13,4 @@ USER node
 COPY --chown=node:node package.json package-lock.json ./
 RUN npm ci && npm cache clean --force
 COPY --chown=node:node . .
-CMD ["sh", "scripts/cron-build.sh"]
+CMD ["sh", "scripts/publish.sh"]

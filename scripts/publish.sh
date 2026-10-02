@@ -1,5 +1,5 @@
 #!/bin/sh
-# 构建端镜像的入口（Dockerfile.builder）：和 .github/workflows/build.yml 的步骤一致，先迁移再构建部署
+# 构建端镜像的入口（Dockerfile.publisher）：和 .github/workflows/build.yml 的步骤一致，先迁移再构建部署
 set -eu
 
 # 和 CI 一样从 wrangler.toml 读 D1 数据库 ID；R2 和 D1 在同一个 Cloudflare 账号下

@@ -1,4 +1,4 @@
-# 构建端镜像（Dockerfile.builder）推到 ghcr，给 K8s CronJob 拉取（deploy/k8s/builder.yaml）。
+# 构建端镜像（Dockerfile.publisher）推到 ghcr，给 K8s CronJob 拉取（deploy/k8s/publisher.yaml）。
 # 标签：latest（main 最新代码）+ sha-<commit>。CronJob 用 latest + imagePullPolicy: Always，部署的总是最新代码
 name: image
 
@@ -39,7 +39,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}-builder
+          images: ghcr.io/${{ github.repository }}-publisher
           tags: |
             type=raw,value=latest
             type=sha
@@ -47,7 +47,7 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.builder
+          file: Dockerfile.publisher
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
