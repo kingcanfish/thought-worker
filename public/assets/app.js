@@ -551,13 +551,34 @@
     }
   });
 
-  /* ── 主题 ── */
-  $("#theme")?.addEventListener("click", () => {
-    const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
-    root.dataset.theme = dark ? "light" : "dark";
+  /* ── 主题：跟随系统（不设 data-theme）→ 浅色 → 深色 ── */
+  const THEMES = [null, "light", "dark"];
+  const THEME_LABEL = { light: "浅色", dark: "深色" };
+  const themeBtn = $("#theme");
+  const themeMetas = $$('meta[name="theme-color"]');
+  // 原始颜色：两个 meta 各按 media 对应浅色 / 深色（THEME_INIT 改过 content 时已存进 data-c）
+  themeMetas.forEach((m) => (m.dataset.c ??= m.content));
+  const applyTheme = (t) => {
+    if (t) root.dataset.theme = t;
+    else delete root.dataset.theme;
+    const color = t && themeMetas.find((m) => m.media.includes(t))?.dataset.c;
+    themeMetas.forEach((m) => (m.content = color || m.dataset.c));
+    const label = `主题：${THEME_LABEL[t] ?? "跟随系统"}`;
+    themeBtn?.setAttribute("title", label);
+    themeBtn?.setAttribute("aria-label", label);
+  };
+  applyTheme(root.dataset.theme || null);
+  themeBtn?.addEventListener("click", () => {
+    const next = THEMES[(THEMES.indexOf(root.dataset.theme || null) + 1) % THEMES.length];
+    applyTheme(next);
     try {
-      localStorage.setItem("theme", root.dataset.theme);
+      if (next) localStorage.setItem("theme", next);
+      else localStorage.removeItem("theme");
     } catch {}
+  });
+  // 别的标签页改了主题
+  addEventListener("storage", (e) => {
+    if (e.key === "theme") applyTheme(THEMES.includes(e.newValue) ? e.newValue : null);
   });
 
   /* ── 移动端吸顶栏 / 回到顶部 ── */

@@ -113,6 +113,10 @@ img.avatar { object-fit: cover; }
 }
 .icon-btn:hover, .icon-btn.on { color: var(--accent); }
 .icon-btn.on { background: var(--accent-soft); }
+.theme-btn > span { display: none; }
+:root:not([data-theme]) .theme-btn .t-auto,
+:root[data-theme="light"] .theme-btn .t-light,
+:root[data-theme="dark"] .theme-btn .t-dark { display: grid; }
 
 /* date picker */
 .cal-wrap { position: relative; flex: none; }

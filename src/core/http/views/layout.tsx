@@ -2,7 +2,7 @@ import type { Child } from "hono/jsx";
 import type { Config } from "../../config";
 
 /** 改了 public/assets 下的文件就把它加一，让浏览器重新下载 */
-export const ASSET_VERSION = "2";
+export const ASSET_VERSION = "3";
 
 export interface Meta {
   title: string;
@@ -12,7 +12,8 @@ export interface Meta {
   type?: "website" | "article";
 }
 
-const THEME_INIT = `try{var t=localStorage.getItem("theme");if(t)document.documentElement.dataset.theme=t}catch(e){}`;
+// 手动选了浅色 / 深色：首次绘制前就设好，地址栏颜色（theme-color）也改成选中的那一档，不再按系统；和 app.js 里的 applyTheme 一致
+const THEME_INIT = `try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark"){document.documentElement.dataset.theme=t;var ms=document.querySelectorAll('meta[name="theme-color"]'),c;ms.forEach(function(m){m.setAttribute("data-c",m.content);if(m.media.indexOf(t)>=0)c=m.content});ms.forEach(function(m){m.content=c})}}catch(e){}`;
 
 export function Layout(props: { config: Config; meta: Meta; origin: string; buildId?: string; children: Child }) {
   const { config, meta, origin } = props;

@@ -163,9 +163,12 @@ function Toolbar() {
   );
 }
 
+/** 三档循环：跟随系统 → 浅色 → 深色；图标显示当前是哪一档（由 CSS 按 data-theme 切换） */
 const ThemeButton = () => (
-  <button type="button" class="icon-btn" id="theme" title="切换主题" aria-label="切换主题">
-    <Icon name="moon" />
+  <button type="button" class="icon-btn theme-btn" id="theme" title="主题：跟随系统" aria-label="主题：跟随系统">
+    <span class="t-auto"><Icon name="auto" /></span>
+    <span class="t-light"><Icon name="sun" /></span>
+    <span class="t-dark"><Icon name="moon" /></span>
   </button>
 );
 
